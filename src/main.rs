@@ -1,13 +1,29 @@
 use pcap::Capture;
 use std::env;
+use std::net::Ipv4Addr;
 use std::process;
 
-// Format slice of bytes into space-separated HEX string
+// Format slice of 6 bytes into colon-separated MAC address string
 fn format_mac(bytes: &[u8]) -> String {
-    bytes.iter()
+    bytes
+        .iter()
         .map(|b| format!("{:02X}", b))
         .collect::<Vec<String>>()
         .join(":")
+}
+
+// Translate IPv4 protocol number to human-readable string
+fn protocol_name(proto: u8) -> &'static str {
+    match proto {
+        1 => "ICMP (Ping)",
+        6 => "TCP (Transmission Control Protocol)",
+        17 => "UDP (User Datagram Protocol)",
+        27 => "RDP",
+        47 => "GRE",
+        50 => "ESP",
+        89 => "OSPF",
+        _ => "Other / Unknown",
+    }
 }
 
 // Print formatted Hex Dump with ASCII view (first N bytes)
@@ -17,12 +33,14 @@ fn print_hex_dump(data: &[u8], max_bytes: usize) {
     println!("  Raw Hex Dump (first {} bytes):", len);
 
     for (idx, chunk) in slice.chunks(16).enumerate() {
-        let hex_str = chunk.iter()
+        let hex_str = chunk
+            .iter()
             .map(|b| format!("{:02X}", b))
             .collect::<Vec<String>>()
             .join(" ");
 
-        let ascii_str: String = chunk.iter()
+        let ascii_str: String = chunk
+            .iter()
             .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
             .collect();
 
@@ -32,7 +50,7 @@ fn print_hex_dump(data: &[u8], max_bytes: usize) {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    
+
     let mut interface_name = String::new();
     let mut i = 1;
     while i < args.len() {
@@ -73,10 +91,10 @@ fn main() {
         packet_count += 1;
         let data = packet.data;
         println!("\n==================================================");
-        println!("  Packet #{} (Length: {} bytes)", packet_count, data.len());
+        println!("  Packet #{} (Total Bytes: {})", packet_count, data.len());
         println!("==================================================");
 
-        // Ethernet Header requires at least 14 bytes
+        // --- LAYER 2: ETHERNET HEADER ---
         if data.len() >= 14 {
             let dst_mac = &data[0..6];
             let src_mac = &data[6..12];
@@ -89,10 +107,31 @@ fn main() {
                 _ => "Unknown / Other",
             };
 
-            println!("  [Ethernet Header]");
+            println!("  [Layer 2 - Ethernet Header]");
             println!("    Destination MAC : {}", format_mac(dst_mac));
             println!("    Source MAC      : {}", format_mac(src_mac));
             println!("    EtherType       : 0x{:04X} -> {}", ether_type, eth_desc);
+
+            // --- LAYER 3: IPv4 HEADER (EtherType == 0x0800) ---
+            if ether_type == 0x0800 && data.len() >= 34 {
+                let version = data[14] >> 4;
+                let ihl_bytes = ((data[14] & 0x0F) * 4) as usize; // Internet Header Length in bytes
+                let total_length = u16::from_be_bytes([data[16], data[17]]);
+                let ttl = data[22];
+                let protocol = data[23];
+
+                let src_ip = Ipv4Addr::new(data[26], data[27], data[28], data[29]);
+                let dst_ip = Ipv4Addr::new(data[30], data[31], data[32], data[33]);
+
+                println!("  [Layer 3 - IPv4 Header]");
+                println!("    IP Version      : IPv{}", version);
+                println!("    Header Length   : {} bytes (IHL: {})", ihl_bytes, data[14] & 0x0F);
+                println!("    Total Length    : {} bytes", total_length);
+                println!("    TTL (Hop Limit) : {}", ttl);
+                println!("    Protocol        : {} ({})", protocol_name(protocol), protocol);
+                println!("    Source IP       : {}", src_ip);
+                println!("    Destination IP  : {}", dst_ip);
+            }
         }
 
         print_hex_dump(data, 64);
