@@ -16,11 +16,10 @@ fn format_mac(bytes: &[u8]) -> String {
 fn protocol_name(proto: u8) -> &'static str {
     match proto {
         1 => "ICMP (Ping)",
+        2 => "IGMP",
         6 => "TCP (Transmission Control Protocol)",
         17 => "UDP (User Datagram Protocol)",
-        27 => "RDP",
-        47 => "GRE",
-        50 => "ESP",
+        41 => "IPv6 Encapsulation",
         89 => "OSPF",
         _ => "Other / Unknown",
     }
@@ -98,13 +97,21 @@ fn main() {
         if data.len() >= 14 {
             let dst_mac = &data[0..6];
             let src_mac = &data[6..12];
-            let ether_type = u16::from_be_bytes([data[12], data[13]]);
+            let mut ether_type = u16::from_be_bytes([data[12], data[13]]);
+            let mut ip_start = 14;
+
+            // Check for 802.1Q VLAN Tag (0x8100)
+            if ether_type == 0x8100 && data.len() >= 18 {
+                ether_type = u16::from_be_bytes([data[16], data[17]]);
+                ip_start = 18;
+            }
 
             let eth_desc = match ether_type {
                 0x0800 => "IPv4 (0x0800)",
                 0x86DD => "IPv6 (0x86DD)",
                 0x0806 => "ARP (0x0806)",
-                _ => "Unknown / Other",
+                0x8100 => "VLAN (0x8100)",
+                _ => "Other Protocol",
             };
 
             println!("  [Layer 2 - Ethernet Header]");
@@ -112,26 +119,45 @@ fn main() {
             println!("    Source MAC      : {}", format_mac(src_mac));
             println!("    EtherType       : 0x{:04X} -> {}", ether_type, eth_desc);
 
-            // --- LAYER 3: IPv4 HEADER (EtherType == 0x0800) ---
-            if ether_type == 0x0800 && data.len() >= 34 {
-                let version = data[14] >> 4;
-                let ihl_bytes = ((data[14] & 0x0F) * 4) as usize; // Internet Header Length in bytes
-                let total_length = u16::from_be_bytes([data[16], data[17]]);
-                let ttl = data[22];
-                let protocol = data[23];
+            // --- LAYER 3: IPv4 HEADER ---
+            if ether_type == 0x0800 && data.len() >= ip_start + 20 {
+                let version = data[ip_start] >> 4;
+                let ihl = data[ip_start] & 0x0F;
+                let ihl_bytes = (ihl * 4) as usize;
+                let total_length = u16::from_be_bytes([data[ip_start + 2], data[ip_start + 3]]);
+                let ttl = data[ip_start + 8];
+                let protocol = data[ip_start + 9];
 
-                let src_ip = Ipv4Addr::new(data[26], data[27], data[28], data[29]);
-                let dst_ip = Ipv4Addr::new(data[30], data[31], data[32], data[33]);
+                let src_ip = Ipv4Addr::new(
+                    data[ip_start + 12],
+                    data[ip_start + 13],
+                    data[ip_start + 14],
+                    data[ip_start + 15],
+                );
+                let dst_ip = Ipv4Addr::new(
+                    data[ip_start + 16],
+                    data[ip_start + 17],
+                    data[ip_start + 18],
+                    data[ip_start + 19],
+                );
 
                 println!("  [Layer 3 - IPv4 Header]");
                 println!("    IP Version      : IPv{}", version);
-                println!("    Header Length   : {} bytes (IHL: {})", ihl_bytes, data[14] & 0x0F);
+                println!("    Header Length   : {} bytes (IHL: {})", ihl_bytes, ihl);
                 println!("    Total Length    : {} bytes", total_length);
                 println!("    TTL (Hop Limit) : {}", ttl);
                 println!("    Protocol        : {} ({})", protocol_name(protocol), protocol);
                 println!("    Source IP       : {}", src_ip);
                 println!("    Destination IP  : {}", dst_ip);
+            } else if ether_type == 0x0806 {
+                println!("  [Layer 3 - ARP Protocol]");
+                println!("    Address Resolution Protocol");
+            } else if ether_type == 0x86DD {
+                println!("  [Layer 3 - IPv6 Protocol]");
+                println!("    IPv6 Packet Detected");
             }
+        } else {
+            println!("  [Warning: Packet size smaller than 14 bytes]");
         }
 
         print_hex_dump(data, 64);
