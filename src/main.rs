@@ -15,13 +15,62 @@ fn format_mac(bytes: &[u8]) -> String {
 // Translate IPv4 protocol number to human-readable string
 fn protocol_name(proto: u8) -> &'static str {
     match proto {
-        1 => "ICMP (Ping)",
+        1 => "ICMP (Control Message)",
         2 => "IGMP",
         6 => "TCP (Transmission Control Protocol)",
         17 => "UDP (User Datagram Protocol)",
         41 => "IPv6 Encapsulation",
         89 => "OSPF",
         _ => "Other / Unknown",
+    }
+}
+
+// Translate common port numbers to service names
+fn port_service(port: u16) -> &'static str {
+    match port {
+        20 | 21 => "FTP",
+        22 => "SSH",
+        23 => "Telnet",
+        25 => "SMTP",
+        53 => "DNS",
+        67 | 68 => "DHCP",
+        80 => "HTTP",
+        123 => "NTP",
+        143 => "IMAP",
+        443 => "HTTPS",
+        3306 => "MySQL",
+        5432 => "PostgreSQL",
+        8080 => "HTTP-Proxy",
+        _ => "Custom/Dynamic",
+    }
+}
+
+// Parse TCP flags byte into human-readable representation
+fn parse_tcp_flags(flags: u8) -> String {
+    let mut active = Vec::new();
+    if flags & 0x01 != 0 { active.push("FIN"); }
+    if flags & 0x02 != 0 { active.push("SYN"); }
+    if flags & 0x04 != 0 { active.push("RST"); }
+    if flags & 0x08 != 0 { active.push("PSH"); }
+    if flags & 0x10 != 0 { active.push("ACK"); }
+    if flags & 0x20 != 0 { active.push("URG"); }
+
+    if active.is_empty() {
+        "NONE".to_string()
+    } else {
+        active.join(" | ")
+    }
+}
+
+// Translate ICMP Type code
+fn icmp_type_name(icmp_type: u8) -> &'static str {
+    match icmp_type {
+        0 => "Echo Reply (Ping Response)",
+        3 => "Destination Unreachable",
+        5 => "Redirect",
+        8 => "Echo Request (Ping Query)",
+        11 => "Time Exceeded",
+        _ => "Other ICMP Type",
     }
 }
 
@@ -149,12 +198,81 @@ fn main() {
                 println!("    Protocol        : {} ({})", protocol_name(protocol), protocol);
                 println!("    Source IP       : {}", src_ip);
                 println!("    Destination IP  : {}", dst_ip);
+
+                // --- LAYER 4: TRANSPORT LAYER PARSING ---
+                let l4_start = ip_start + ihl_bytes;
+
+                if protocol == 6 && data.len() >= l4_start + 20 {
+                    // TCP Header Parsing
+                    let src_port = u16::from_be_bytes([data[l4_start], data[l4_start + 1]]);
+                    let dst_port = u16::from_be_bytes([data[l4_start + 2], data[l4_start + 3]]);
+                    let seq_num = u32::from_be_bytes([
+                        data[l4_start + 4],
+                        data[l4_start + 5],
+                        data[l4_start + 6],
+                        data[l4_start + 7],
+                    ]);
+                    let ack_num = u32::from_be_bytes([
+                        data[l4_start + 8],
+                        data[l4_start + 9],
+                        data[l4_start + 10],
+                        data[l4_start + 11],
+                    ]);
+                    let tcp_offset = (data[l4_start + 12] >> 4) * 4;
+                    let flags = data[l4_start + 13];
+
+                    println!("  [Layer 4 - TCP Header]");
+                    println!(
+                        "    Source Port     : {} ({})",
+                        src_port,
+                        port_service(src_port)
+                    );
+                    println!(
+                        "    Destination Port: {} ({})",
+                        dst_port,
+                        port_service(dst_port)
+                    );
+                    println!("    Sequence Num    : {}", seq_num);
+                    println!("    Ack Num         : {}", ack_num);
+                    println!("    Header Length   : {} bytes", tcp_offset);
+                    println!("    Control Flags   : [ {} ] (0x{:02X})", parse_tcp_flags(flags), flags);
+
+                } else if protocol == 17 && data.len() >= l4_start + 8 {
+                    // UDP Header Parsing
+                    let src_port = u16::from_be_bytes([data[l4_start], data[l4_start + 1]]);
+                    let dst_port = u16::from_be_bytes([data[l4_start + 2], data[l4_start + 3]]);
+                    let udp_len = u16::from_be_bytes([data[l4_start + 4], data[l4_start + 5]]);
+                    let checksum = u16::from_be_bytes([data[l4_start + 6], data[l4_start + 7]]);
+
+                    println!("  [Layer 4 - UDP Header]");
+                    println!(
+                        "    Source Port     : {} ({})",
+                        src_port,
+                        port_service(src_port)
+                    );
+                    println!(
+                        "    Destination Port: {} ({})",
+                        dst_port,
+                        port_service(dst_port)
+                    );
+                    println!("    UDP Length      : {} bytes", udp_len);
+                    println!("    Checksum        : 0x{:04X}", checksum);
+
+                } else if protocol == 1 && data.len() >= l4_start + 4 {
+                    // ICMP Header Parsing
+                    let icmp_type = data[l4_start];
+                    let icmp_code = data[l4_start + 1];
+                    let checksum = u16::from_be_bytes([data[l4_start + 2], data[l4_start + 3]]);
+
+                    println!("  [Layer 4 - ICMP Header]");
+                    println!("    Type            : {} ({})", icmp_type, icmp_type_name(icmp_type));
+                    println!("    Code            : {}", icmp_code);
+                    println!("    Checksum        : 0x{:04X}", checksum);
+                }
             } else if ether_type == 0x0806 {
                 println!("  [Layer 3 - ARP Protocol]");
-                println!("    Address Resolution Protocol");
             } else if ether_type == 0x86DD {
                 println!("  [Layer 3 - IPv6 Protocol]");
-                println!("    IPv6 Packet Detected");
             }
         } else {
             println!("  [Warning: Packet size smaller than 14 bytes]");
