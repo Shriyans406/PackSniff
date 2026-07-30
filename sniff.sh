@@ -8,8 +8,9 @@ fi
 
 # 2. Auto-detect active network interface if not specified
 INTERFACE=""
-if [ -n "$1" ]; then
+if [ -n "$1" ] && [[ "$1" != --* ]]; then
     INTERFACE="$1"
+    shift
 else
     INTERFACE=$(ip link show | grep -E "^[0-9]" | awk -F': ' '{print $2}' | grep -v "^lo$" | head -1)
 fi
@@ -36,6 +37,6 @@ trap cleanup INT TERM EXIT
 echo "[+] Enabling promiscuous mode on $INTERFACE..."
 ip link set "$INTERFACE" promisc on
 
-# 5. Build and run Rust engine
+# 5. Build and run Rust engine with all passed filter arguments
 echo "[+] Building and starting Rust packet engine..."
-cargo run --quiet -- --interface "$INTERFACE"
+cargo run --quiet -- --interface "$INTERFACE" "$@"
