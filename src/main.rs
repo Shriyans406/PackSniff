@@ -4,16 +4,14 @@ use std::net::Ipv4Addr;
 use std::process;
 use std::str::FromStr;
 
-// Enum representing the active packet filter
 #[derive(Debug, Clone, PartialEq)]
 enum PacketFilter {
     None,
-    Protocol(u8),       // 6 = TCP, 17 = UDP, 1 = ICMP
-    Port(u16),          // Matches source or destination port
-    Ip(Ipv4Addr),       // Matches source or destination IP
+    Protocol(u8),
+    Port(u16),
+    Ip(Ipv4Addr),
 }
 
-// Format slice of 6 bytes into colon-separated MAC address string
 fn format_mac(bytes: &[u8]) -> String {
     bytes
         .iter()
@@ -22,20 +20,18 @@ fn format_mac(bytes: &[u8]) -> String {
         .join(":")
 }
 
-// Translate IPv4 protocol number to human-readable string
 fn protocol_name(proto: u8) -> &'static str {
     match proto {
-        1 => "ICMP (Control Message)",
+        1 => "ICMP",
         2 => "IGMP",
-        6 => "TCP (Transmission Control Protocol)",
-        17 => "UDP (User Datagram Protocol)",
-        41 => "IPv6 Encapsulation",
+        6 => "TCP",
+        17 => "UDP",
+        41 => "IPv6-Encaps",
         89 => "OSPF",
-        _ => "Other / Unknown",
+        _ => "OTHER",
     }
 }
 
-// Translate common port numbers to service names
 fn port_service(port: u16) -> &'static str {
     match port {
         20 | 21 => "FTP",
@@ -51,11 +47,10 @@ fn port_service(port: u16) -> &'static str {
         3306 => "MySQL",
         5432 => "PostgreSQL",
         8080 => "HTTP-Proxy",
-        _ => "Custom/Dynamic",
+        _ => "CUSTOM",
     }
 }
 
-// Parse TCP flags byte into human-readable representation
 fn parse_tcp_flags(flags: u8) -> String {
     let mut active = Vec::new();
     if flags & 0x01 != 0 { active.push("FIN"); }
@@ -64,27 +59,25 @@ fn parse_tcp_flags(flags: u8) -> String {
     if flags & 0x08 != 0 { active.push("PSH"); }
     if flags & 0x10 != 0 { active.push("ACK"); }
     if flags & 0x20 != 0 { active.push("URG"); }
-
-    if active.is_empty() {
-        "NONE".to_string()
-    } else {
-        active.join(" | ")
-    }
+    if active.is_empty() { "NONE".to_string() } else { active.join("|") }
 }
 
-// Translate ICMP Type code
 fn icmp_type_name(icmp_type: u8) -> &'static str {
     match icmp_type {
-        0 => "Echo Reply (Ping Response)",
-        3 => "Destination Unreachable",
+        0 => "Echo Reply",
+        3 => "Dst Unreachable",
         5 => "Redirect",
-        8 => "Echo Request (Ping Query)",
+        8 => "Echo Request",
         11 => "Time Exceeded",
-        _ => "Other ICMP Type",
+        _ => "ICMP Other",
     }
 }
 
-// Print formatted Hex Dump with ASCII view (first N bytes)
+fn hex_encode(data: &[u8], max_bytes: usize) -> String {
+    let len = data.len().min(max_bytes);
+    data[..len].iter().map(|b| format!("{:02X}", b)).collect::<Vec<String>>().join(" ")
+}
+
 fn print_hex_dump(data: &[u8], max_bytes: usize) {
     let len = data.len().min(max_bytes);
     let slice = &data[..len];
@@ -111,6 +104,7 @@ fn main() {
 
     let mut interface_name = String::new();
     let mut filter = PacketFilter::None;
+    let mut json_mode = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -120,6 +114,9 @@ fn main() {
                     interface_name = args[i + 1].clone();
                     i += 1;
                 }
+            }
+            "--json" | "-j" => {
+                json_mode = true;
             }
             "--filter" | "-f" => {
                 if i + 1 < args.len() {
@@ -171,16 +168,18 @@ fn main() {
 
     if interface_name.is_empty() {
         eprintln!("Error: No network interface specified.");
-        eprintln!("Usage: packet-sniffer-engine --interface <INTERFACE> [--filter tcp|udp|icmp|port <PORT>|ip <IP>]");
+        eprintln!("Usage: packet-sniffer-engine --interface <INTERFACE> [--json] [--filter tcp|udp|icmp|port <PORT>|ip <IP>]");
         process::exit(1);
     }
 
-    println!("Listening on interface: {}...", interface_name);
-    match &filter {
-        PacketFilter::None => println!("Active Filter: NONE (Capturing All Packets)"),
-        PacketFilter::Protocol(p) => println!("Active Filter: PROTOCOL -> {} ({})", protocol_name(*p), p),
-        PacketFilter::Port(p) => println!("Active Filter: PORT -> {}", p),
-        PacketFilter::Ip(ip) => println!("Active Filter: IP ADDRESS -> {}", ip),
+    if !json_mode {
+        println!("Listening on interface: {}...", interface_name);
+        match &filter {
+            PacketFilter::None => println!("Active Filter: NONE (Capturing All Packets)"),
+            PacketFilter::Protocol(p) => println!("Active Filter: PROTOCOL -> {} ({})", protocol_name(*p), p),
+            PacketFilter::Port(p) => println!("Active Filter: PORT -> {}", p),
+            PacketFilter::Ip(ip) => println!("Active Filter: IP ADDRESS -> {}", ip),
+        }
     }
 
     let mut cap = match Capture::from_device(interface_name.as_str()) {
@@ -204,7 +203,6 @@ fn main() {
         packet_count += 1;
         let data = packet.data;
 
-        // Check Layer 2 Ethernet header
         if data.len() >= 14 {
             let dst_mac = &data[0..6];
             let src_mac = &data[6..12];
@@ -216,19 +214,22 @@ fn main() {
                 ip_start = 18;
             }
 
-            // --- FILTER CHECK LOGIC ---
             let mut matches_filter = false;
             let mut src_ip_opt = None;
             let mut dst_ip_opt = None;
             let mut protocol_opt = None;
             let mut src_port_opt = None;
             let mut dst_port_opt = None;
+            let mut ttl_opt = None;
+            let mut l4_info = String::new();
 
             if ether_type == 0x0800 && data.len() >= ip_start + 20 {
                 let ihl = data[ip_start] & 0x0F;
                 let ihl_bytes = (ihl * 4) as usize;
                 let protocol = data[ip_start + 9];
+                let ttl = data[ip_start + 8];
                 protocol_opt = Some(protocol);
+                ttl_opt = Some(ttl);
 
                 let src_ip = Ipv4Addr::new(
                     data[ip_start + 12],
@@ -247,11 +248,24 @@ fn main() {
 
                 let l4_start = ip_start + ihl_bytes;
 
-                if (protocol == 6 || protocol == 17) && data.len() >= l4_start + 4 {
+                if protocol == 6 && data.len() >= l4_start + 14 {
                     let src_port = u16::from_be_bytes([data[l4_start], data[l4_start + 1]]);
                     let dst_port = u16::from_be_bytes([data[l4_start + 2], data[l4_start + 3]]);
+                    let flags = data[l4_start + 13];
                     src_port_opt = Some(src_port);
                     dst_port_opt = Some(dst_port);
+                    l4_info = format!("Flags: [{}]", parse_tcp_flags(flags));
+                } else if protocol == 17 && data.len() >= l4_start + 8 {
+                    let src_port = u16::from_be_bytes([data[l4_start], data[l4_start + 1]]);
+                    let dst_port = u16::from_be_bytes([data[l4_start + 2], data[l4_start + 3]]);
+                    let udp_len = u16::from_be_bytes([data[l4_start + 4], data[l4_start + 5]]);
+                    src_port_opt = Some(src_port);
+                    dst_port_opt = Some(dst_port);
+                    l4_info = format!("Len: {}B", udp_len);
+                } else if protocol == 1 && data.len() >= l4_start + 4 {
+                    let icmp_type = data[l4_start];
+                    let icmp_code = data[l4_start + 1];
+                    l4_info = format!("Type {} ({}) Code {}", icmp_type, icmp_type_name(icmp_type), icmp_code);
                 }
             }
 
@@ -275,102 +289,105 @@ fn main() {
             }
 
             if !matches_filter {
-                continue; // Skip printing unmatched packets
+                continue;
             }
 
             matched_count += 1;
 
-            let eth_desc = match ether_type {
-                0x0800 => "IPv4 (0x0800)",
-                0x86DD => "IPv6 (0x86DD)",
-                0x0806 => "ARP (0x0806)",
-                0x8100 => "VLAN (0x8100)",
-                _ => "Other Protocol",
-            };
+            if json_mode {
+                let proto_str = match protocol_opt {
+                    Some(p) => protocol_name(p),
+                    None => match ether_type {
+                        0x0806 => "ARP",
+                        0x86DD => "IPv6",
+                        _ => "ETH",
+                    },
+                };
 
-            println!("\n==================================================");
-            println!("  Matched Packet #{} (Captured Total: {}, Bytes: {})", matched_count, packet_count, data.len());
-            println!("==================================================");
+                let src_ip_str = src_ip_opt.map(|ip| ip.to_string()).unwrap_or_else(|| format_mac(src_mac));
+                let dst_ip_str = dst_ip_opt.map(|ip| ip.to_string()).unwrap_or_else(|| format_mac(dst_mac));
+                let hex_str = hex_encode(data, 32);
 
-            println!("  [Layer 2 - Ethernet Header]");
-            println!("    Destination MAC : {}", format_mac(dst_mac));
-            println!("    Source MAC      : {}", format_mac(src_mac));
-            println!("    EtherType       : 0x{:04X} -> {}", ether_type, eth_desc);
+                let json_line = format!(
+                    "{{\"id\":{},\"captured\":{},\"len\":{},\"proto\":\"{}\",\"src\":\"{}\",\"dst\":\"{}\",\"src_port\":{},\"dst_port\":{},\"ttl\":{},\"l4_info\":\"{}\",\"src_mac\":\"{}\",\"dst_mac\":\"{}\",\"hex\":\"{}\"}}",
+                    matched_count,
+                    packet_count,
+                    data.len(),
+                    proto_str,
+                    src_ip_str,
+                    dst_ip_str,
+                    src_port_opt.map(|p| p.to_string()).unwrap_or_else(|| "null".to_string()),
+                    dst_port_opt.map(|p| p.to_string()).unwrap_or_else(|| "null".to_string()),
+                    ttl_opt.map(|t| t.to_string()).unwrap_or_else(|| "null".to_string()),
+                    l4_info.replace('"', "\\\""),
+                    format_mac(src_mac),
+                    format_mac(dst_mac),
+                    hex_str
+                );
 
-            if ether_type == 0x0800 && data.len() >= ip_start + 20 {
-                let version = data[ip_start] >> 4;
-                let ihl = data[ip_start] & 0x0F;
-                let ihl_bytes = (ihl * 4) as usize;
-                let total_length = u16::from_be_bytes([data[ip_start + 2], data[ip_start + 3]]);
-                let ttl = data[ip_start + 8];
-                let protocol = protocol_opt.unwrap();
+                println!("{}", json_line);
+            } else {
+                let eth_desc = match ether_type {
+                    0x0800 => "IPv4 (0x0800)",
+                    0x86DD => "IPv6 (0x86DD)",
+                    0x0806 => "ARP (0x0806)",
+                    0x8100 => "VLAN (0x8100)",
+                    _ => "Other Protocol",
+                };
 
-                println!("  [Layer 3 - IPv4 Header]");
-                println!("    IP Version      : IPv{}", version);
-                println!("    Header Length   : {} bytes (IHL: {})", ihl_bytes, ihl);
-                println!("    Total Length    : {} bytes", total_length);
-                println!("    TTL (Hop Limit) : {}", ttl);
-                println!("    Protocol        : {} ({})", protocol_name(protocol), protocol);
-                println!("    Source IP       : {}", src_ip_opt.unwrap());
-                println!("    Destination IP  : {}", dst_ip_opt.unwrap());
+                println!("\n==================================================");
+                println!("  Matched Packet #{} (Captured Total: {}, Bytes: {})", matched_count, packet_count, data.len());
+                println!("==================================================");
 
-                let l4_start = ip_start + ihl_bytes;
+                println!("  [Layer 2 - Ethernet Header]");
+                println!("    Destination MAC : {}", format_mac(dst_mac));
+                println!("    Source MAC      : {}", format_mac(src_mac));
+                println!("    EtherType       : 0x{:04X} -> {}", ether_type, eth_desc);
 
-                if protocol == 6 && data.len() >= l4_start + 20 {
-                    let src_port = src_port_opt.unwrap();
-                    let dst_port = dst_port_opt.unwrap();
-                    let seq_num = u32::from_be_bytes([
-                        data[l4_start + 4],
-                        data[l4_start + 5],
-                        data[l4_start + 6],
-                        data[l4_start + 7],
-                    ]);
-                    let ack_num = u32::from_be_bytes([
-                        data[l4_start + 8],
-                        data[l4_start + 9],
-                        data[l4_start + 10],
-                        data[l4_start + 11],
-                    ]);
-                    let tcp_offset = (data[l4_start + 12] >> 4) * 4;
-                    let flags = data[l4_start + 13];
+                if ether_type == 0x0800 && data.len() >= ip_start + 20 {
+                    let version = data[ip_start] >> 4;
+                    let ihl = data[ip_start] & 0x0F;
+                    let ihl_bytes = (ihl * 4) as usize;
+                    let total_length = u16::from_be_bytes([data[ip_start + 2], data[ip_start + 3]]);
+                    let ttl = data[ip_start + 8];
+                    let protocol = protocol_opt.unwrap();
 
-                    println!("  [Layer 4 - TCP Header]");
-                    println!("    Source Port     : {} ({})", src_port, port_service(src_port));
-                    println!("    Destination Port: {} ({})", dst_port, port_service(dst_port));
-                    println!("    Sequence Num    : {}", seq_num);
-                    println!("    Ack Num         : {}", ack_num);
-                    println!("    Header Length   : {} bytes", tcp_offset);
-                    println!("    Control Flags   : [ {} ] (0x{:02X})", parse_tcp_flags(flags), flags);
+                    println!("  [Layer 3 - IPv4 Header]");
+                    println!("    IP Version      : IPv{}", version);
+                    println!("    Header Length   : {} bytes (IHL: {})", ihl_bytes, ihl);
+                    println!("    Total Length    : {} bytes", total_length);
+                    println!("    TTL (Hop Limit) : {}", ttl);
+                    println!("    Protocol        : {} ({})", protocol_name(protocol), protocol);
+                    println!("    Source IP       : {}", src_ip_opt.unwrap());
+                    println!("    Destination IP  : {}", dst_ip_opt.unwrap());
 
-                } else if protocol == 17 && data.len() >= l4_start + 8 {
-                    let src_port = src_port_opt.unwrap();
-                    let dst_port = dst_port_opt.unwrap();
-                    let udp_len = u16::from_be_bytes([data[l4_start + 4], data[l4_start + 5]]);
-                    let checksum = u16::from_be_bytes([data[l4_start + 6], data[l4_start + 7]]);
+                    let l4_start = ip_start + ihl_bytes;
 
-                    println!("  [Layer 4 - UDP Header]");
-                    println!("    Source Port     : {} ({})", src_port, port_service(src_port));
-                    println!("    Destination Port: {} ({})", dst_port, port_service(dst_port));
-                    println!("    UDP Length      : {} bytes", udp_len);
-                    println!("    Checksum        : 0x{:04X}", checksum);
+                    if protocol == 6 && data.len() >= l4_start + 20 {
+                        let src_port = src_port_opt.unwrap();
+                        let dst_port = dst_port_opt.unwrap();
+                        let flags = data[l4_start + 13];
 
-                } else if protocol == 1 && data.len() >= l4_start + 4 {
-                    let icmp_type = data[l4_start];
-                    let icmp_code = data[l4_start + 1];
-                    let checksum = u16::from_be_bytes([data[l4_start + 2], data[l4_start + 3]]);
-
-                    println!("  [Layer 4 - ICMP Header]");
-                    println!("    Type            : {} ({})", icmp_type, icmp_type_name(icmp_type));
-                    println!("    Code            : {}", icmp_code);
-                    println!("    Checksum        : 0x{:04X}", checksum);
+                        println!("  [Layer 4 - TCP Header]");
+                        println!("    Source Port     : {} ({})", src_port, port_service(src_port));
+                        println!("    Destination Port: {} ({})", dst_port, port_service(dst_port));
+                        println!("    Control Flags   : [ {} ] (0x{:02X})", parse_tcp_flags(flags), flags);
+                    } else if protocol == 17 && data.len() >= l4_start + 8 {
+                        let src_port = src_port_opt.unwrap();
+                        let dst_port = dst_port_opt.unwrap();
+                        println!("  [Layer 4 - UDP Header]");
+                        println!("    Source Port     : {} ({})", src_port, port_service(src_port));
+                        println!("    Destination Port: {} ({})", dst_port, port_service(dst_port));
+                    } else if protocol == 1 && data.len() >= l4_start + 4 {
+                        let icmp_type = data[l4_start];
+                        let icmp_code = data[l4_start + 1];
+                        println!("  [Layer 4 - ICMP Header]");
+                        println!("    Type            : {} ({})", icmp_type, icmp_type_name(icmp_type));
+                        println!("    Code            : {}", icmp_code);
+                    }
                 }
-            } else if ether_type == 0x0806 {
-                println!("  [Layer 3 - ARP Protocol]");
-            } else if ether_type == 0x86DD {
-                println!("  [Layer 3 - IPv6 Protocol]");
+                print_hex_dump(data, 64);
             }
-
-            print_hex_dump(data, 64);
         }
     }
 }
