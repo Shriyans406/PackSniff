@@ -1,5 +1,6 @@
 use pcap::Capture;
 use std::env;
+use std::io::{self, Write};
 use std::net::Ipv4Addr;
 use std::process;
 use std::str::FromStr;
@@ -96,6 +97,14 @@ fn print_hex_dump(data: &[u8], max_bytes: usize) {
             .collect();
 
         println!("    {:04X}:  {:47}  |{}|", idx * 16, hex_str, ascii_str);
+    }
+}
+
+fn safe_println(msg: &str) {
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    if writeln!(handle, "{}", msg).is_err() {
+        process::exit(0);
     }
 }
 
@@ -325,7 +334,7 @@ fn main() {
                     hex_str
                 );
 
-                println!("{}", json_line);
+                safe_println(&json_line);
             } else {
                 let eth_desc = match ether_type {
                     0x0800 => "IPv4 (0x0800)",

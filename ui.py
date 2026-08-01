@@ -13,7 +13,10 @@ try:
     from rich.text import Text
 except ImportError:
     print("[+] 'rich' module not found. Auto-installing rich...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "rich", "--quiet"])
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "rich", "--break-system-packages", "--quiet"])
+    except Exception:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "rich", "--quiet"])
     from rich.console import Console
     from rich.live import Live
     from rich.table import Table
