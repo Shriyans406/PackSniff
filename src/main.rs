@@ -114,6 +114,8 @@ fn main() {
     let mut interface_name = String::new();
     let mut filter = PacketFilter::None;
     let mut json_mode = false;
+    let mut save_path: Option<String> = None;
+    let mut read_path: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -126,6 +128,18 @@ fn main() {
             }
             "--json" | "-j" => {
                 json_mode = true;
+            }
+            "--save" | "-s" => {
+                if i + 1 < args.len() {
+                    save_path = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
+            "--read" | "-r" => {
+                if i + 1 < args.len() {
+                    read_path = Some(args[i + 1].clone());
+                    i += 1;
+                }
             }
             "--filter" | "-f" => {
                 if i + 1 < args.len() {
@@ -175,42 +189,92 @@ fn main() {
         i += 1;
     }
 
-    if interface_name.is_empty() {
-        eprintln!("Error: No network interface specified.");
-        eprintln!("Usage: packet-sniffer-engine --interface <INTERFACE> [--json] [--filter tcp|udp|icmp|port <PORT>|ip <IP>]");
+    if read_path.is_none() && interface_name.is_empty() {
+        eprintln!("Error: No network interface or PCAP file specified.");
+        eprintln!("Usage: packet-sniffer-engine [--interface <INTERFACE> | --read <FILE.pcap>] [--save <FILE.pcap>] [--json]");
         process::exit(1);
     }
 
+    // Open Live Capture or Offline PCAP file
+    let mut cap_live: Option<Capture<pcap::Active>> = None;
+    let mut cap_offline: Option<Capture<pcap::Offline>> = None;
+
+    if let Some(ref r_path) = read_path {
+        if !json_mode {
+            println!("Reading offline PCAP file: {}...", r_path);
+        }
+        match Capture::from_file(r_path) {
+            Ok(c) => cap_offline = Some(c),
+            Err(e) => {
+                eprintln!("Failed to open PCAP file '{}': {}", r_path, e);
+                process::exit(1);
+            }
+        }
+    } else {
+        if !json_mode {
+            println!("Listening on interface: {}...", interface_name);
+        }
+        match Capture::from_device(interface_name.as_str()) {
+            Ok(device) => match device.promisc(true).immediate_mode(true).open() {
+                Ok(c) => cap_live = Some(c),
+                Err(e) => {
+                    eprintln!("Failed to open device '{}': {}", interface_name, e);
+                    process::exit(1);
+                }
+            },
+            Err(e) => {
+                eprintln!("Failed to find device '{}': {}", interface_name, e);
+                process::exit(1);
+            }
+        }
+    }
+
     if !json_mode {
-        println!("Listening on interface: {}...", interface_name);
         match &filter {
             PacketFilter::None => println!("Active Filter: NONE (Capturing All Packets)"),
             PacketFilter::Protocol(p) => println!("Active Filter: PROTOCOL -> {} ({})", protocol_name(*p), p),
             PacketFilter::Port(p) => println!("Active Filter: PORT -> {}", p),
             PacketFilter::Ip(ip) => println!("Active Filter: IP ADDRESS -> {}", ip),
         }
+        if let Some(ref s_path) = save_path {
+            println!("Saving live capture to PCAP file: {}...", s_path);
+        }
     }
 
-    let mut cap = match Capture::from_device(interface_name.as_str()) {
-        Ok(device) => match device.promisc(true).immediate_mode(true).open() {
-            Ok(cap) => cap,
+    // Initialize Savefile if --save is passed in live capture mode
+    let mut savefile = if let (Some(ref s_path), Some(ref mut c_live)) = (&save_path, &mut cap_live) {
+        match c_live.savefile(s_path) {
+            Ok(sf) => Some(sf),
             Err(e) => {
-                eprintln!("Failed to open device '{}': {}", interface_name, e);
+                eprintln!("Failed to create savefile '{}': {}", s_path, e);
                 process::exit(1);
             }
-        },
-        Err(e) => {
-            eprintln!("Failed to find device '{}': {}", interface_name, e);
-            process::exit(1);
         }
+    } else {
+        None
     };
 
     let mut packet_count: u64 = 0;
     let mut matched_count: u64 = 0;
 
-    while let Ok(packet) = cap.next_packet() {
+    let mut get_next_packet = || -> Option<pcap::Packet> {
+        if let Some(ref mut c_live) = cap_live {
+            c_live.next_packet().ok().map(|p| p.to_owned())
+        } else if let Some(ref mut c_off) = cap_offline {
+            c_off.next_packet().ok().map(|p| p.to_owned())
+        } else {
+            None
+        }
+    };
+
+    while let Some(packet) = get_next_packet() {
         packet_count += 1;
         let data = packet.data;
+
+        // Save raw packet to PCAP file if saving enabled
+        if let Some(ref mut sf) = savefile {
+            sf.write(&packet);
+        }
 
         if data.len() >= 14 {
             let dst_mac = &data[0..6];
@@ -398,5 +462,9 @@ fn main() {
                 print_hex_dump(data, 64);
             }
         }
+    }
+
+    if !json_mode {
+        println!("\n[+] Finished processing packets. Matched: {}, Total Processed: {}", matched_count, packet_count);
     }
 }
