@@ -257,17 +257,20 @@ fn main() {
     let mut packet_count: u64 = 0;
     let mut matched_count: u64 = 0;
 
-    let mut get_next_packet = || -> Option<pcap::Packet> {
-        if let Some(ref mut c_live) = cap_live {
-            c_live.next_packet().ok().map(|p| p.to_owned())
+    loop {
+        let packet = if let Some(ref mut c_live) = cap_live {
+            match c_live.next_packet() {
+                Ok(p) => p,
+                Err(_) => break,
+            }
         } else if let Some(ref mut c_off) = cap_offline {
-            c_off.next_packet().ok().map(|p| p.to_owned())
+            match c_off.next_packet() {
+                Ok(p) => p,
+                Err(_) => break,
+            }
         } else {
-            None
-        }
-    };
-
-    while let Some(packet) = get_next_packet() {
+            break;
+        };
         packet_count += 1;
         let data = packet.data;
 
