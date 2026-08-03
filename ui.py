@@ -121,7 +121,7 @@ class BandwidthTracker:
             "mbits": mbits,
             "pps": pps,
             "peak_kbs": self.peak_kbs,
-            "avg_kbs": self.avg_kbs
+            "avg_kbs": avg_kbs
         }
 
 def format_bytes(b):
