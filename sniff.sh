@@ -1,6 +1,5 @@
 #!/bin/bash
 
-# 1. Check for --ui, --read, and --save flags
 UI_MODE=false
 READ_MODE=false
 ARGS=()
@@ -23,13 +22,11 @@ while [ $i -le $# ]; do
     i=$((i+1))
 done
 
-# 2. Require root only for live interface capture (not required for offline reading)
 if [ "$READ_MODE" = false ] && [ "$EUID" -ne 0 ]; then
     echo "[!] Error: Live packet sniffing requires root privileges. Please run with sudo!"
     exit 1
 fi
 
-# 3. Detect active interface if not in offline read mode
 INTERFACE=""
 if [ "$READ_MODE" = false ]; then
     if [ -n "${ARGS[0]}" ] && [[ "${ARGS[0]}" != --* ]]; then
@@ -45,7 +42,6 @@ if [ "$READ_MODE" = false ]; then
     fi
 fi
 
-# 4. Setup cleanup trap function for live capture
 cleanup() {
     if [ "$READ_MODE" = false ] && [ -n "$INTERFACE" ]; then
         echo ""
@@ -58,16 +54,14 @@ cleanup() {
 
 trap cleanup INT TERM EXIT
 
-# 5. Enable promiscuous mode for live capture
 if [ "$READ_MODE" = false ]; then
     echo "[+] Enabling promiscuous mode on $INTERFACE..."
     ip link set "$INTERFACE" promisc on
 fi
 
-# 6. Execute Engine
 if [ "$READ_MODE" = true ]; then
     if [ "$UI_MODE" = true ]; then
-        echo "[+] Replaying PCAP file in Python Rich UI..."
+        echo "[+] Replaying PCAP file in Python Rich UI with Domain Labels..."
         cargo run --quiet -- --json "${ARGS[@]}" | python3 ui.py
     else
         echo "[+] Reading offline PCAP file..."
@@ -75,7 +69,7 @@ if [ "$READ_MODE" = true ]; then
     fi
 else
     if [ "$UI_MODE" = true ]; then
-        echo "[+] Launching PackSniff Rust Engine with Python Rich UI..."
+        echo "[+] Launching PackSniff Rust Engine with Domain Labels..."
         cargo run --quiet -- --interface "$INTERFACE" --json "${ARGS[@]}" | python3 ui.py
     else
         echo "[+] Building and starting Rust packet engine..."

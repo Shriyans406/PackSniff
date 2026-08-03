@@ -2,6 +2,8 @@
 import sys
 import json
 import time
+import socket
+import threading
 import subprocess
 from collections import defaultdict
 
@@ -28,11 +30,58 @@ except ImportError:
 
 console = Console()
 
+# Static Domain & Service Dictionary Overrides for Instant Display
+KNOWN_DOMAINS = {
+    "8.8.8.8": "dns.google",
+    "8.8.4.4": "dns.google",
+    "1.1.1.1": "one.one.one.one",
+    "1.0.0.1": "one.one.one.one",
+    "9.9.9.9": "dns.quad9.net",
+    "10.0.2.2": "Gateway/Host Router",
+    "10.0.2.15": "Local VM (Debian)",
+    "127.0.0.1": "localhost",
+}
+
+# Thread-safe Reverse DNS Cache
+dns_cache = dict(KNOWN_DOMAINS)
+cache_lock = threading.Lock()
+pending_lookups = set()
+
+def resolve_ip_async(ip_str):
+    """Background thread function for non-blocking Reverse DNS lookup."""
+    if not ip_str or ip_str.startswith("00:") or ip_str in KNOWN_DOMAINS:
+        return
+    with cache_lock:
+        if ip_str in dns_cache or ip_str in pending_lookups:
+            return
+        pending_lookups.add(ip_str)
+
+    def worker():
+        try:
+            domain, _, _ = socket.gethostbyaddr(ip_str)
+        except Exception:
+            domain = ip_str  # Fallback to raw IP on failure/timeout
+        with cache_lock:
+            dns_cache[ip_str] = domain
+            pending_lookups.discard(ip_str)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+def get_label(ip_str):
+    """Returns domain name label if resolved, otherwise returns raw IP."""
+    with cache_lock:
+        resolved = dns_cache.get(ip_str)
+    if resolved and resolved != ip_str:
+        return f"{ip_str} ({resolved})"
+    else:
+        resolve_ip_async(ip_str)
+        return str(ip_str)
+
 class BandwidthTracker:
     def __init__(self):
         self.window_seconds = 1.0
-        self.history = []  # list of (timestamp, byte_count)
-        self.packet_history = []  # list of (timestamp, 1)
+        self.history = []
+        self.packet_history = []
         self.peak_kbs = 0.0
         self.start_time = time.time()
         self.total_bytes = 0
@@ -72,7 +121,7 @@ class BandwidthTracker:
             "mbits": mbits,
             "pps": pps,
             "peak_kbs": self.peak_kbs,
-            "avg_kbs": avg_kbs
+            "avg_kbs": self.avg_kbs
         }
 
 def format_bytes(b):
@@ -127,8 +176,8 @@ def create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats):
         Layout(name="footer", size=5)
     )
 
-    # 1. Header Banner & Dynamic Bandwidth Gauge
-    header_title = Text(" 🛡️  PACKSNIFF RUST ENGINE — LIVE PACKET & BANDWIDTH DASHBOARD 🛡️ \n", style="bold white on blue", justify="center")
+    # 1. Header Banner & Bandwidth Metrics
+    header_title = Text(" 🛡️  PACKSNIFF RUST ENGINE — REVERSE DNS & DOMAIN DASHBOARD 🛡️ \n", style="bold white on blue", justify="center")
     gauge_str = (
         f"[bold white]Speed:[/bold white] [bold cyan]{rates['kbs']:.2f} KB/s[/bold cyan] ({rates['mbits']:.2f} Mbit/s)  |  "
         f"[bold white]Rate:[/bold white] [bold green]{rates['pps']:.0f} pkts/s[/bold green]  |  "
@@ -139,18 +188,18 @@ def create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats):
     header_content = Text.assemble(header_title, Text.from_markup(gauge_str, justify="center"))
     layout["header"].update(Panel(header_content, style="blue"))
 
-    # 2. Main Content Split: Stream (Left) & Top IP Talkers (Right)
+    # 2. Main Content Split: Stream (Left) & Top IP Talkers / Domains (Right)
     layout["main"].split_row(
         Layout(name="stream", ratio=2),
         Layout(name="top_talkers", ratio=1)
     )
 
-    # Stream Table
+    # Stream Table with Domain Resolver Labels
     stream_table = Table(expand=True, box=None)
     stream_table.add_column("#", style="dim", width=5)
     stream_table.add_column("Proto", width=7, justify="center")
-    stream_table.add_column("Source IP / Port", width=21)
-    stream_table.add_column("Destination IP / Port", width=21)
+    stream_table.add_column("Source IP / Domain", width=25)
+    stream_table.add_column("Destination IP / Domain", width=25)
     stream_table.add_column("Size", width=8, justify="right")
     stream_table.add_column("Details", style="italic")
 
@@ -165,8 +214,14 @@ def create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats):
         else:
             proto_style = "bold green"
 
-        src_str = f"{p.get('src')}:{p.get('src_port')}" if p.get('src_port') else str(p.get('src'))
-        dst_str = f"{p.get('dst')}:{p.get('dst_port')}" if p.get('dst_port') else str(p.get('dst'))
+        src_val = p.get("src", "")
+        dst_val = p.get("dst", "")
+
+        src_lbl = get_label(src_val)
+        dst_lbl = get_label(dst_val)
+
+        src_str = f"{src_lbl}:{p.get('src_port')}" if p.get('src_port') else src_lbl
+        dst_str = f"{dst_lbl}:{p.get('dst_port')}" if p.get('dst_port') else dst_lbl
 
         stream_table.add_row(
             str(p.get("id")),
@@ -176,11 +231,11 @@ def create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats):
             f"{p.get('len')} B",
             p.get("l4_info", "")
         )
-    layout["stream"].update(Panel(stream_table, title="[bold white]Live Packet Stream (Recent 12)[/bold white]", border_style="cyan"))
+    layout["stream"].update(Panel(stream_table, title="[bold white]Live Packet Stream with Domain Labels (Recent 12)[/bold white]", border_style="cyan"))
 
-    # Top IP Talkers Table
+    # Top IP Talkers & Domain Names Table
     talkers_table = Table(expand=True, box=None)
-    talkers_table.add_column("Host IP Address", style="bold white")
+    talkers_table.add_column("Host IP / Domain", style="bold white")
     talkers_table.add_column("Packets", justify="right")
     talkers_table.add_column("Volume", justify="right")
     talkers_table.add_column("Share", justify="right", style="cyan")
@@ -190,15 +245,16 @@ def create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats):
 
     for ip, stat in sorted_ips:
         share_pct = (stat["bytes"] / total_vol) * 100
+        domain_lbl = get_label(ip)
         talkers_table.add_row(
-            ip,
+            domain_lbl,
             str(stat["pkts"]),
             format_bytes(stat["bytes"]),
             f"{share_pct:.1f}%"
         )
-    layout["top_talkers"].update(Panel(talkers_table, title="[bold white]Top IP Talkers (Top 5)[/bold white]", border_style="magenta"))
+    layout["top_talkers"].update(Panel(talkers_table, title="[bold white]Top Talkers & Domain Labels (Top 5)[/bold white]", border_style="magenta"))
 
-    # 3. Footer: Protocol Ratio Bar & Packet Inspector
+    # 3. Footer: Protocol Ratio & Inspector
     ratio_element = build_ratio_bar(metrics)
     latest_info = ""
     if latest_packet:
@@ -241,9 +297,11 @@ def main():
                 if src_ip:
                     ip_stats[src_ip]["pkts"] += 1
                     ip_stats[src_ip]["bytes"] += pkt_len
+                    resolve_ip_async(src_ip)
                 if dst_ip and dst_ip != src_ip:
                     ip_stats[dst_ip]["pkts"] += 1
                     ip_stats[dst_ip]["bytes"] += pkt_len
+                    resolve_ip_async(dst_ip)
 
                 proto = p.get("proto")
                 if proto == "TCP":
