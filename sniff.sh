@@ -1,5 +1,47 @@
 #!/bin/bash
 
+# --- PRE-FLIGHT DEPENDENCY CHECK ---
+check_dependencies() {
+    if ! command -v cargo &> /dev/null; then
+        echo "[!] Error: Cargo (Rust compiler package manager) is not installed or not in PATH."
+        echo "    Install Rust: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+        exit 1
+    fi
+
+    if ! command -v python3 &> /dev/null; then
+        echo "[!] Error: Python 3 is not installed or not in PATH."
+        echo "    Install Python 3: sudo apt install python3 python3-pip"
+        exit 1
+    fi
+}
+
+show_help() {
+    echo "================================================================================"
+    echo "  🛡️  PACKSNIFF SHELL WRAPPER — HELP & USAGE MENU"
+    echo "================================================================================"
+    echo ""
+    echo "USAGE:"
+    echo "  sudo ./sniff.sh [INTERFACE] [OPTIONS]"
+    echo "  ./sniff.sh --read <FILE.pcap> [OPTIONS]"
+    echo ""
+    echo "OPTIONS:"
+    echo "  --ui                   Launch live Python Rich TUI telemetry dashboard"
+    echo "  --read, -r <FILE.pcap> Replay saved PCAP capture file offline"
+    echo "  --save, -s <FILE.pcap> Save live captured traffic to PCAP file"
+    echo "  --filter, -f <TYPE>    Filter traffic (tcp, udp, icmp, port <P>, ip <ADDR>)"
+    echo "  --help, -h             Show this help screen"
+    echo ""
+    echo "EXAMPLES:"
+    echo "  sudo ./sniff.sh enp0s3 --ui"
+    echo "  sudo ./sniff.sh enp0s3 --filter port 443 --ui"
+    echo "  sudo ./sniff.sh enp0s3 --save traffic.pcap --ui"
+    echo "  ./sniff.sh --read traffic.pcap --ui"
+    echo "================================================================================"
+    exit 0
+}
+
+check_dependencies
+
 UI_MODE=false
 READ_MODE=false
 ARGS=()
@@ -7,7 +49,9 @@ ARGS=()
 i=1
 while [ $i -le $# ]; do
     arg="${!i}"
-    if [ "$arg" == "--ui" ]; then
+    if [ "$arg" == "--help" ] || [ "$arg" == "-h" ]; then
+        show_help
+    elif [ "$arg" == "--ui" ]; then
         UI_MODE=true
     elif [ "$arg" == "--read" ] || [ "$arg" == "-r" ]; then
         READ_MODE=true
@@ -22,11 +66,14 @@ while [ $i -le $# ]; do
     i=$((i+1))
 done
 
+# Root privilege validation for live packet capture
 if [ "$READ_MODE" = false ] && [ "$EUID" -ne 0 ]; then
-    echo "[!] Error: Live packet sniffing requires root privileges. Please run with sudo!"
+    echo "[!] Error: Live packet sniffing requires root privileges."
+    echo "    Please run with: sudo ./sniff.sh [INTERFACE] [OPTIONS]"
     exit 1
 fi
 
+# Detect network interface if not reading offline PCAP file
 INTERFACE=""
 if [ "$READ_MODE" = false ]; then
     if [ -n "${ARGS[0]}" ] && [[ "${ARGS[0]}" != --* ]]; then
@@ -38,30 +85,34 @@ if [ "$READ_MODE" = false ]; then
 
     if [ -z "$INTERFACE" ]; then
         echo "[!] Error: Could not detect an active network interface."
+        echo "    Specify interface explicitly: sudo ./sniff.sh enp0s3"
         exit 1
     fi
 fi
 
+# Cleanup trap restoring promiscuous mode safely
 cleanup() {
     if [ "$READ_MODE" = false ] && [ -n "$INTERFACE" ]; then
         echo ""
-        echo "[+] Disabling promiscuous mode on $INTERFACE..."
-        ip link set "$INTERFACE" promisc off
-        echo "[+] Interface $INTERFACE restored. Sniffer stopped safely."
+        echo "[+] Restoring interface state..."
+        ip link set "$INTERFACE" promisc off &> /dev/null
+        echo "[+] Interface $INTERFACE promiscuous mode disabled. Sniffer stopped safely."
     fi
     exit 0
 }
 
 trap cleanup INT TERM EXIT
 
+# Enable promiscuous mode for live capture
 if [ "$READ_MODE" = false ]; then
     echo "[+] Enabling promiscuous mode on $INTERFACE..."
     ip link set "$INTERFACE" promisc on
 fi
 
+# Execute Pipeline
 if [ "$READ_MODE" = true ]; then
     if [ "$UI_MODE" = true ]; then
-        echo "[+] Replaying PCAP file in Python Rich UI with Domain Labels..."
+        echo "[+] Replaying PCAP file in Python Rich UI..."
         cargo run --quiet -- --json "${ARGS[@]}" | python3 ui.py
     else
         echo "[+] Reading offline PCAP file..."
@@ -69,10 +120,10 @@ if [ "$READ_MODE" = true ]; then
     fi
 else
     if [ "$UI_MODE" = true ]; then
-        echo "[+] Launching PackSniff Rust Engine with Domain Labels..."
+        echo "[+] Launching PackSniff Rust Engine with Python Rich UI..."
         cargo run --quiet -- --interface "$INTERFACE" --json "${ARGS[@]}" | python3 ui.py
     else
-        echo "[+] Building and starting Rust packet engine..."
+        echo "[+] Building and starting Rust packet engine on $INTERFACE..."
         cargo run --quiet -- --interface "$INTERFACE" "${ARGS[@]}"
     fi
 fi
