@@ -13,6 +13,44 @@ enum PacketFilter {
     Ip(Ipv4Addr),
 }
 
+fn print_help() {
+    println!(
+        r#"
+================================================================================
+  🛡️  PACKSNIFF RUST ENGINE — COMMAND LINE INTERFACE & HELP
+================================================================================
+
+USAGE:
+    packet-sniffer-engine [OPTIONS]
+
+CAPTURE SOURCE OPTIONS (Required):
+    --interface, -i <NAME>   Specify active network interface to capture live (e.g. enp0s3)
+    --read, -r <FILE.pcap>   Read and replay offline PCAP capture file
+
+OUTPUT FORMAT OPTIONS:
+    --json, -j               Output line-delimited JSON stream for TUI presenter
+    --save, -s <FILE.pcap>   Save raw live captured packets to a PCAP file
+
+FILTERING OPTIONS:
+    --filter, -f <TYPE>      Apply traffic filter:
+                             - tcp        Isolate TCP packets (Protocol 6)
+                             - udp        Isolate UDP packets (Protocol 17)
+                             - icmp       Isolate ICMP packets (Protocol 1)
+                             - port <P>   Isolate packets with Source/Dst Port P
+                             - ip <ADDR>  Isolate packets with Source/Dst IPv4 ADDR
+
+MISCELLANEOUS:
+    --help, -h               Display this help banner and exit
+
+EXAMPLES:
+    packet-sniffer-engine --interface enp0s3
+    packet-sniffer-engine --interface enp0s3 --filter tcp --json
+    packet-sniffer-engine --interface enp0s3 --save capture.pcap
+    packet-sniffer-engine --read capture.pcap --filter ip 8.8.8.8
+================================================================================"#
+    );
+}
+
 fn format_mac(bytes: &[u8]) -> String {
     bytes
         .iter()
@@ -100,6 +138,7 @@ fn print_hex_dump(data: &[u8], max_bytes: usize) {
     }
 }
 
+// Write to stdout safely; exit cleanly on SIGPIPE (when downstream reader closes pipe)
 fn safe_println(msg: &str) {
     let stdout = io::stdout();
     let mut handle = stdout.lock();
@@ -120,10 +159,17 @@ fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--help" | "-h" => {
+                print_help();
+                process::exit(0);
+            }
             "--interface" | "-i" => {
                 if i + 1 < args.len() {
                     interface_name = args[i + 1].clone();
                     i += 1;
+                } else {
+                    eprintln!("[!] Error: Option '--interface' requires an interface name argument.");
+                    process::exit(1);
                 }
             }
             "--json" | "-j" => {
@@ -133,12 +179,18 @@ fn main() {
                 if i + 1 < args.len() {
                     save_path = Some(args[i + 1].clone());
                     i += 1;
+                } else {
+                    eprintln!("[!] Error: Option '--save' requires a file path argument.");
+                    process::exit(1);
                 }
             }
             "--read" | "-r" => {
                 if i + 1 < args.len() {
                     read_path = Some(args[i + 1].clone());
                     i += 1;
+                } else {
+                    eprintln!("[!] Error: Option '--read' requires a PCAP file path argument.");
+                    process::exit(1);
                 }
             }
             "--filter" | "-f" => {
@@ -150,38 +202,39 @@ fn main() {
                         "udp" => filter = PacketFilter::Protocol(17),
                         "icmp" => filter = PacketFilter::Protocol(1),
                         "port" => {
-                            if i + 1 < args.len() {
-                                if let Ok(port) = args[i + 1].parse::<u16>() {
+                            if i < args.len() {
+                                if let Ok(port) = args[i].parse::<u16>() {
                                     filter = PacketFilter::Port(port);
-                                    i += 1;
                                 } else {
-                                    eprintln!("Error: Invalid port number '{}'", args[i + 1]);
+                                    eprintln!("[!] Error: Invalid port number '{}'. Must be an integer 1-65535.", args[i]);
                                     process::exit(1);
                                 }
                             } else {
-                                eprintln!("Error: '--filter port' requires a port number argument.");
+                                eprintln!("[!] Error: '--filter port' requires a port number argument.");
                                 process::exit(1);
                             }
                         }
                         "ip" => {
-                            if i + 1 < args.len() {
-                                if let Ok(ip) = Ipv4Addr::from_str(&args[i + 1]) {
+                            if i < args.len() {
+                                if let Ok(ip) = Ipv4Addr::from_str(&args[i]) {
                                     filter = PacketFilter::Ip(ip);
-                                    i += 1;
                                 } else {
-                                    eprintln!("Error: Invalid IP address '{}'", args[i + 1]);
+                                    eprintln!("[!] Error: Invalid IPv4 address '{}'. Example format: 8.8.8.8", args[i]);
                                     process::exit(1);
                                 }
                             } else {
-                                eprintln!("Error: '--filter ip' requires an IP address argument.");
+                                eprintln!("[!] Error: '--filter ip' requires an IP address argument.");
                                 process::exit(1);
                             }
                         }
                         _ => {
-                            eprintln!("Error: Unknown filter mode '{}'. Options: tcp, udp, icmp, port <PORT>, ip <IP>", filter_type);
+                            eprintln!("[!] Error: Unknown filter mode '{}'. Valid options: tcp, udp, icmp, port <PORT>, ip <IP>", filter_type);
                             process::exit(1);
                         }
                     }
+                } else {
+                    eprintln!("[!] Error: Option '--filter' requires a filter type argument.");
+                    process::exit(1);
                 }
             }
             _ => {}
@@ -190,8 +243,8 @@ fn main() {
     }
 
     if read_path.is_none() && interface_name.is_empty() {
-        eprintln!("Error: No network interface or PCAP file specified.");
-        eprintln!("Usage: packet-sniffer-engine [--interface <INTERFACE> | --read <FILE.pcap>] [--save <FILE.pcap>] [--json]");
+        eprintln!("[!] Error: No network interface or PCAP file specified.");
+        eprintln!("Run 'packet-sniffer-engine --help' for complete usage instructions.");
         process::exit(1);
     }
 
@@ -201,29 +254,29 @@ fn main() {
 
     if let Some(ref r_path) = read_path {
         if !json_mode {
-            println!("Reading offline PCAP file: {}...", r_path);
+            println!("[+] Opening offline PCAP file: {}...", r_path);
         }
         match Capture::from_file(r_path) {
             Ok(c) => cap_offline = Some(c),
             Err(e) => {
-                eprintln!("Failed to open PCAP file '{}': {}", r_path, e);
+                eprintln!("[!] Failed to open PCAP file '{}': {}", r_path, e);
                 process::exit(1);
             }
         }
     } else {
         if !json_mode {
-            println!("Listening on interface: {}...", interface_name);
+            println!("[+] Opening live interface: {}...", interface_name);
         }
         match Capture::from_device(interface_name.as_str()) {
             Ok(device) => match device.promisc(true).immediate_mode(true).open() {
                 Ok(c) => cap_live = Some(c),
                 Err(e) => {
-                    eprintln!("Failed to open device '{}': {}", interface_name, e);
+                    eprintln!("[!] Failed to open device '{}': {}", interface_name, e);
                     process::exit(1);
                 }
             },
             Err(e) => {
-                eprintln!("Failed to find device '{}': {}", interface_name, e);
+                eprintln!("[!] Failed to find device '{}': {}", interface_name, e);
                 process::exit(1);
             }
         }
@@ -231,22 +284,22 @@ fn main() {
 
     if !json_mode {
         match &filter {
-            PacketFilter::None => println!("Active Filter: NONE (Capturing All Packets)"),
-            PacketFilter::Protocol(p) => println!("Active Filter: PROTOCOL -> {} ({})", protocol_name(*p), p),
-            PacketFilter::Port(p) => println!("Active Filter: PORT -> {}", p),
-            PacketFilter::Ip(ip) => println!("Active Filter: IP ADDRESS -> {}", ip),
+            PacketFilter::None => println!("[+] Active Filter: NONE (Capturing All Traffic)"),
+            PacketFilter::Protocol(p) => println!("[+] Active Filter: PROTOCOL -> {} ({})", protocol_name(*p), p),
+            PacketFilter::Port(p) => println!("[+] Active Filter: PORT -> {}", p),
+            PacketFilter::Ip(ip) => println!("[+] Active Filter: IP ADDRESS -> {}", ip),
         }
         if let Some(ref s_path) = save_path {
-            println!("Saving live capture to PCAP file: {}...", s_path);
+            println!("[+] Saving live capture to PCAP file: {}...", s_path);
         }
     }
 
-    // Initialize Savefile if --save is passed in live capture mode
+    // Initialize Savefile if --save is enabled for live capture
     let mut savefile = if let (Some(ref s_path), Some(ref mut c_live)) = (&save_path, &mut cap_live) {
         match c_live.savefile(s_path) {
             Ok(sf) => Some(sf),
             Err(e) => {
-                eprintln!("Failed to create savefile '{}': {}", s_path, e);
+                eprintln!("[!] Failed to create savefile '{}': {}", s_path, e);
                 process::exit(1);
             }
         }
@@ -257,24 +310,21 @@ fn main() {
     let mut packet_count: u64 = 0;
     let mut matched_count: u64 = 0;
 
-    loop {
-        let packet = if let Some(ref mut c_live) = cap_live {
-            match c_live.next_packet() {
-                Ok(p) => p,
-                Err(_) => break,
-            }
+    let mut get_next_packet = || -> Option<pcap::Packet> {
+        if let Some(ref mut c_live) = cap_live {
+            c_live.next_packet().ok().map(|p| p.to_owned())
         } else if let Some(ref mut c_off) = cap_offline {
-            match c_off.next_packet() {
-                Ok(p) => p,
-                Err(_) => break,
-            }
+            c_off.next_packet().ok().map(|p| p.to_owned())
         } else {
-            break;
-        };
+            None
+        }
+    };
+
+    while let Some(packet) = get_next_packet() {
         packet_count += 1;
         let data = packet.data;
 
-        // Save raw packet to PCAP file if saving enabled
+        // Write raw packet to PCAP savefile if enabled
         if let Some(ref mut sf) = savefile {
             sf.write(&packet);
         }
