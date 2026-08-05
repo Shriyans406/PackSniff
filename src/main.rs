@@ -310,23 +310,35 @@ fn main() {
     let mut packet_count: u64 = 0;
     let mut matched_count: u64 = 0;
 
-    let mut get_next_packet = || -> Option<pcap::Packet> {
-        if let Some(ref mut c_live) = cap_live {
-            c_live.next_packet().ok().map(|p| p.to_owned())
+    loop {
+        let (data_bytes, save_pkt) = if let Some(ref mut c_live) = cap_live {
+            match c_live.next_packet() {
+                Ok(packet) => {
+                    let b = packet.data.to_vec();
+                    (b, Some(packet))
+                }
+                Err(_) => break,
+            }
         } else if let Some(ref mut c_off) = cap_offline {
-            c_off.next_packet().ok().map(|p| p.to_owned())
+            match c_off.next_packet() {
+                Ok(packet) => {
+                    let b = packet.data.to_vec();
+                    (b, None)
+                }
+                Err(_) => break,
+            }
         } else {
-            None
-        }
-    };
+            break;
+        };
 
-    while let Some(packet) = get_next_packet() {
         packet_count += 1;
-        let data = packet.data;
+        let data = &data_bytes[..];
 
         // Write raw packet to PCAP savefile if enabled
         if let Some(ref mut sf) = savefile {
-            sf.write(&packet);
+            if let Some(ref pkt) = save_pkt {
+                sf.write(pkt);
+            }
         }
 
         if data.len() >= 14 {
@@ -521,3 +533,81 @@ fn main() {
         println!("\n[+] Finished processing packets. Matched: {}, Total Processed: {}", matched_count, packet_count);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_mac() {
+        let mac_bytes = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        assert_eq!(format_mac(&mac_bytes), "00:11:22:33:44:55");
+    }
+
+    #[test]
+    fn test_protocol_name() {
+        assert_eq!(protocol_name(1), "ICMP");
+        assert_eq!(protocol_name(6), "TCP");
+        assert_eq!(protocol_name(17), "UDP");
+        assert_eq!(protocol_name(41), "IPv6-Encaps");
+        assert_eq!(protocol_name(89), "OSPF");
+        assert_eq!(protocol_name(255), "OTHER");
+    }
+
+    #[test]
+    fn test_port_service() {
+        assert_eq!(port_service(22), "SSH");
+        assert_eq!(port_service(53), "DNS");
+        assert_eq!(port_service(80), "HTTP");
+        assert_eq!(port_service(443), "HTTPS");
+        assert_eq!(port_service(9999), "CUSTOM");
+    }
+
+    #[test]
+    fn test_parse_tcp_flags() {
+        assert_eq!(parse_tcp_flags(0x02), "SYN");
+        assert_eq!(parse_tcp_flags(0x12), "SYN|ACK");
+        assert_eq!(parse_tcp_flags(0x01), "FIN");
+        assert_eq!(parse_tcp_flags(0x04), "RST");
+        assert_eq!(parse_tcp_flags(0x00), "NONE");
+    }
+
+    #[test]
+    fn test_icmp_type_name() {
+        assert_eq!(icmp_type_name(0), "Echo Reply");
+        assert_eq!(icmp_type_name(8), "Echo Request");
+        assert_eq!(icmp_type_name(3), "Dst Unreachable");
+        assert_eq!(icmp_type_name(99), "ICMP Other");
+    }
+
+    #[test]
+    fn test_hex_encode() {
+        let data = [0xDE, 0xAD, 0xBE, 0xEF];
+        assert_eq!(hex_encode(&data, 4), "DE AD BE EF");
+        assert_eq!(hex_encode(&data, 2), "DE AD");
+    }
+
+    #[test]
+    fn test_ethernet_ipv4_parsing() {
+        // Construct mock 34-byte Ethernet + IPv4 ICMP packet
+        let pkt = vec![
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, // Dst MAC
+            0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, // Src MAC
+            0x08, 0x00,                         // EtherType: IPv4
+            0x45, 0x00, 0x00, 0x54, 0x1A, 0x2B, 0x40, 0x00,
+            0x40, 0x01, 0xBD, 0x37,             // TTL: 64, Protocol: 1 (ICMP)
+            10, 0, 2, 15,                       // Src IP: 10.0.2.15
+            8, 8, 8, 8                          // Dst IP: 8.8.8.8
+        ];
+
+        assert!(pkt.len() >= 14);
+        let ether_type = u16::from_be_bytes([pkt[12], pkt[13]]);
+        assert_eq!(ether_type, 0x0800);
+
+        let src_ip = Ipv4Addr::new(pkt[26], pkt[27], pkt[28], pkt[29]);
+        let dst_ip = Ipv4Addr::new(pkt[30], pkt[31], pkt[32], pkt[33]);
+        assert_eq!(src_ip.to_string(), "10.0.2.15");
+        assert_eq!(dst_ip.to_string(), "8.8.8.8");
+    }
+}
+
