@@ -92,6 +92,7 @@ fi
 
 # Cleanup trap restoring promiscuous mode safely
 cleanup() {
+    trap - INT TERM EXIT
     if [ "$READ_MODE" = false ] && [ -n "$INTERFACE" ]; then
         echo ""
         echo "[+] Restoring interface state..."
