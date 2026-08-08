@@ -5,13 +5,392 @@ use std::net::Ipv4Addr;
 use std::process;
 use std::str::FromStr;
 
+// --- ADVANCED PACKET FILTERING AST DATA STRUCTURES ---
+
 #[derive(Debug, Clone, PartialEq)]
-enum PacketFilter {
-    None,
-    Protocol(u8),
-    Port(u16),
-    Ip(Ipv4Addr),
+pub enum SizeOp {
+    Equal,
+    GreaterThan,
+    GreaterThanOrEqual,
+    LessThan,
+    LessThanOrEqual,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FilterCondition {
+    Protocol(u8),
+    SrcIp(Ipv4Addr),
+    DstIp(Ipv4Addr),
+    Ip(Ipv4Addr),
+    SrcPort(u16),
+    DstPort(u16),
+    Port(u16),
+    PacketSize(SizeOp, usize),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FilterExpr {
+    Any,
+    Match(FilterCondition),
+    And(Box<FilterExpr>, Box<FilterExpr>),
+    Or(Box<FilterExpr>, Box<FilterExpr>),
+    Not(Box<FilterExpr>),
+}
+
+impl FilterExpr {
+    pub fn matches(
+        &self,
+        pkt_size: usize,
+        _eth_type: u16,
+        src_ip: Option<Ipv4Addr>,
+        dst_ip: Option<Ipv4Addr>,
+        proto: Option<u8>,
+        src_port: Option<u16>,
+        dst_port: Option<u16>,
+    ) -> bool {
+        match self {
+            FilterExpr::Any => true,
+            FilterExpr::Not(sub) => !sub.matches(pkt_size, _eth_type, src_ip, dst_ip, proto, src_port, dst_port),
+            FilterExpr::And(left, right) => {
+                left.matches(pkt_size, _eth_type, src_ip, dst_ip, proto, src_port, dst_port)
+                    && right.matches(pkt_size, _eth_type, src_ip, dst_ip, proto, src_port, dst_port)
+            }
+            FilterExpr::Or(left, right) => {
+                left.matches(pkt_size, _eth_type, src_ip, dst_ip, proto, src_port, dst_port)
+                    || right.matches(pkt_size, _eth_type, src_ip, dst_ip, proto, src_port, dst_port)
+            }
+            FilterExpr::Match(cond) => match cond {
+                FilterCondition::Protocol(p) => proto == Some(*p),
+                FilterCondition::SrcIp(ip) => src_ip == Some(*ip),
+                FilterCondition::DstIp(ip) => dst_ip == Some(*ip),
+                FilterCondition::Ip(ip) => src_ip == Some(*ip) || dst_ip == Some(*ip),
+                FilterCondition::SrcPort(p) => src_port == Some(*p),
+                FilterCondition::DstPort(p) => dst_port == Some(*p),
+                FilterCondition::Port(p) => src_port == Some(*p) || dst_port == Some(*p),
+                FilterCondition::PacketSize(op, val) => match op {
+                    SizeOp::Equal => pkt_size == *val,
+                    SizeOp::GreaterThan => pkt_size > *val,
+                    SizeOp::GreaterThanOrEqual => pkt_size >= *val,
+                    SizeOp::LessThan => pkt_size < *val,
+                    SizeOp::LessThanOrEqual => pkt_size <= *val,
+                },
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for FilterExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FilterExpr::Any => write!(f, "NONE (Capturing All Traffic)"),
+            FilterExpr::Match(cond) => match cond {
+                FilterCondition::Protocol(p) => write!(f, "proto == {}", protocol_name(*p)),
+                FilterCondition::SrcIp(ip) => write!(f, "src_ip == {}", ip),
+                FilterCondition::DstIp(ip) => write!(f, "dst_ip == {}", ip),
+                FilterCondition::Ip(ip) => write!(f, "host == {}", ip),
+                FilterCondition::SrcPort(p) => write!(f, "sport == {}", p),
+                FilterCondition::DstPort(p) => write!(f, "dport == {}", p),
+                FilterCondition::Port(p) => write!(f, "port == {}", p),
+                FilterCondition::PacketSize(op, sz) => match op {
+                    SizeOp::Equal => write!(f, "size == {}B", sz),
+                    SizeOp::GreaterThan => write!(f, "size > {}B", sz),
+                    SizeOp::GreaterThanOrEqual => write!(f, "size >= {}B", sz),
+                    SizeOp::LessThan => write!(f, "size < {}B", sz),
+                    SizeOp::LessThanOrEqual => write!(f, "size <= {}B", sz),
+                },
+            },
+            FilterExpr::And(left, right) => write!(f, "({} AND {})", left, right),
+            FilterExpr::Or(left, right) => write!(f, "({} OR {})", left, right),
+            FilterExpr::Not(sub) => write!(f, "NOT ({})", sub),
+        }
+    }
+}
+
+// --- LEXER & PARSER FOR FILTER EXPRESSIONS ---
+
+#[derive(Debug, Clone, PartialEq)]
+enum Token {
+    LParen,
+    RParen,
+    And,
+    Or,
+    Not,
+    Word(String),
+}
+
+fn tokenize(input: &str) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    let mut chars = input.chars().peekable();
+
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+
+        if c == '(' {
+            tokens.push(Token::LParen);
+            chars.next();
+        } else if c == ')' {
+            tokens.push(Token::RParen);
+            chars.next();
+        } else if c == '!' {
+            tokens.push(Token::Not);
+            chars.next();
+        } else if c == '&' {
+            chars.next();
+            if chars.peek() == Some(&'&') {
+                chars.next();
+            }
+            tokens.push(Token::And);
+        } else if c == '|' {
+            chars.next();
+            if chars.peek() == Some(&'|') {
+                chars.next();
+            }
+            tokens.push(Token::Or);
+        } else {
+            let mut word = String::new();
+            while let Some(&ch) = chars.peek() {
+                if ch.is_whitespace() || ch == '(' || ch == ')' || ch == '!' {
+                    break;
+                }
+                word.push(ch);
+                chars.next();
+            }
+
+            if !word.is_empty() {
+                let lower = word.to_lowercase();
+                if lower == "and" {
+                    tokens.push(Token::And);
+                } else if lower == "or" {
+                    tokens.push(Token::Or);
+                } else if lower == "not" {
+                    tokens.push(Token::Not);
+                } else {
+                    tokens.push(Token::Word(word));
+                }
+            }
+        }
+    }
+    tokens
+}
+
+struct Parser {
+    tokens: Vec<Token>,
+    pos: usize,
+}
+
+impl Parser {
+    fn new(tokens: Vec<Token>) -> Self {
+        Parser { tokens, pos: 0 }
+    }
+
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.pos)
+    }
+
+    fn next_token(&mut self) -> Option<Token> {
+        if self.pos < self.tokens.len() {
+            let tok = self.tokens[self.pos].clone();
+            self.pos += 1;
+            Some(tok)
+        } else {
+            None
+        }
+    }
+
+    fn parse_expr(&mut self) -> Result<FilterExpr, String> {
+        self.parse_or()
+    }
+
+    fn parse_or(&mut self) -> Result<FilterExpr, String> {
+        let mut left = self.parse_and()?;
+        while let Some(Token::Or) = self.peek() {
+            self.next_token();
+            let right = self.parse_and()?;
+            left = FilterExpr::Or(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_and(&mut self) -> Result<FilterExpr, String> {
+        let mut left = self.parse_not()?;
+        loop {
+            if let Some(Token::And) = self.peek() {
+                self.next_token();
+                let right = self.parse_not()?;
+                left = FilterExpr::And(Box::new(left), Box::new(right));
+            } else if self.is_primary_start() {
+                // Implicit AND e.g. "tcp port 443"
+                let right = self.parse_not()?;
+                left = FilterExpr::And(Box::new(left), Box::new(right));
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    fn is_primary_start(&self) -> bool {
+        match self.peek() {
+            Some(Token::LParen) | Some(Token::Not) | Some(Token::Word(_)) => true,
+            _ => false,
+        }
+    }
+
+    fn parse_not(&mut self) -> Result<FilterExpr, String> {
+        if let Some(Token::Not) = self.peek() {
+            self.next_token();
+            let expr = self.parse_not()?;
+            Ok(FilterExpr::Not(Box::new(expr)))
+        } else {
+            self.parse_primary()
+        }
+    }
+
+    fn parse_primary(&mut self) -> Result<FilterExpr, String> {
+        match self.next_token() {
+            Some(Token::LParen) => {
+                let expr = self.parse_expr()?;
+                match self.next_token() {
+                    Some(Token::RParen) => Ok(expr),
+                    _ => Err("Expected closing parenthesis ')'".to_string()),
+                }
+            }
+            Some(Token::Word(w)) => {
+                let lower = w.to_lowercase();
+                match lower.as_str() {
+                    "tcp" => Ok(FilterExpr::Match(FilterCondition::Protocol(6))),
+                    "udp" => Ok(FilterExpr::Match(FilterCondition::Protocol(17))),
+                    "icmp" => Ok(FilterExpr::Match(FilterCondition::Protocol(1))),
+                    "src" | "src_ip" | "srcip" => {
+                        let ip_str = self.expect_word("Expected IP address after 'src'")?;
+                        let ip = Ipv4Addr::from_str(&ip_str)
+                            .map_err(|_| format!("Invalid IPv4 address '{}' after 'src'", ip_str))?;
+                        Ok(FilterExpr::Match(FilterCondition::SrcIp(ip)))
+                    }
+                    "dst" | "dst_ip" | "dstip" => {
+                        let ip_str = self.expect_word("Expected IP address after 'dst'")?;
+                        let ip = Ipv4Addr::from_str(&ip_str)
+                            .map_err(|_| format!("Invalid IPv4 address '{}' after 'dst'", ip_str))?;
+                        Ok(FilterExpr::Match(FilterCondition::DstIp(ip)))
+                    }
+                    "ip" | "host" => {
+                        let ip_str = self.expect_word("Expected IP address after 'ip'")?;
+                        let ip = Ipv4Addr::from_str(&ip_str)
+                            .map_err(|_| format!("Invalid IPv4 address '{}' after 'ip'", ip_str))?;
+                        Ok(FilterExpr::Match(FilterCondition::Ip(ip)))
+                    }
+                    "sport" | "src_port" | "srcport" => {
+                        let p_str = self.expect_word("Expected port number after 'sport'")?;
+                        let p = p_str.parse::<u16>()
+                            .map_err(|_| format!("Invalid port number '{}' after 'sport'", p_str))?;
+                        Ok(FilterExpr::Match(FilterCondition::SrcPort(p)))
+                    }
+                    "dport" | "dst_port" | "dstport" => {
+                        let p_str = self.expect_word("Expected port number after 'dport'")?;
+                        let p = p_str.parse::<u16>()
+                            .map_err(|_| format!("Invalid port number '{}' after 'dport'", p_str))?;
+                        Ok(FilterExpr::Match(FilterCondition::DstPort(p)))
+                    }
+                    "port" => {
+                        let p_str = self.expect_word("Expected port number after 'port'")?;
+                        let p = p_str.parse::<u16>()
+                            .map_err(|_| format!("Invalid port number '{}' after 'port'", p_str))?;
+                        Ok(FilterExpr::Match(FilterCondition::Port(p)))
+                    }
+                    "size" | "len" => {
+                        let (op, sz_str) = self.parse_size_op_and_val()?;
+                        let val = sz_str.parse::<usize>()
+                            .map_err(|_| format!("Invalid packet size number '{}'", sz_str))?;
+                        Ok(FilterExpr::Match(FilterCondition::PacketSize(op, val)))
+                    }
+                    _ => {
+                        if let Ok(ip) = Ipv4Addr::from_str(&w) {
+                            Ok(FilterExpr::Match(FilterCondition::Ip(ip)))
+                        } else if let Ok(p) = w.parse::<u16>() {
+                            Ok(FilterExpr::Match(FilterCondition::Port(p)))
+                        } else {
+                            Err(format!("Unknown filter token '{}'", w))
+                        }
+                    }
+                }
+            }
+            Some(tok) => Err(format!("Unexpected token '{:?}'", tok)),
+            None => Err("Unexpected end of filter expression".to_string()),
+        }
+    }
+
+    fn expect_word(&mut self, err_msg: &str) -> Result<String, String> {
+        match self.next_token() {
+            Some(Token::Word(w)) => Ok(w),
+            _ => Err(err_msg.to_string()),
+        }
+    }
+
+    fn parse_size_op_and_val(&mut self) -> Result<(SizeOp, String), String> {
+        let first_word = self.expect_word("Expected size operator or number after 'size'")?;
+        match first_word.as_str() {
+            ">" => {
+                let val_str = self.expect_word("Expected number after 'size >'")?;
+                Ok((SizeOp::GreaterThan, val_str))
+            }
+            ">=" => {
+                let val_str = self.expect_word("Expected number after 'size >='")?;
+                Ok((SizeOp::GreaterThanOrEqual, val_str))
+            }
+            "<" => {
+                let val_str = self.expect_word("Expected number after 'size <'")?;
+                Ok((SizeOp::LessThan, val_str))
+            }
+            "<=" => {
+                let val_str = self.expect_word("Expected number after 'size <='")?;
+                Ok((SizeOp::LessThanOrEqual, val_str))
+            }
+            "==" | "=" => {
+                let val_str = self.expect_word("Expected number after 'size =='")?;
+                Ok((SizeOp::Equal, val_str))
+            }
+            other => {
+                if other.starts_with(">=") {
+                    Ok((SizeOp::GreaterThanOrEqual, other[2..].to_string()))
+                } else if other.starts_with("<=") {
+                    Ok((SizeOp::LessThanOrEqual, other[2..].to_string()))
+                } else if other.starts_with('>') {
+                    Ok((SizeOp::GreaterThan, other[1..].to_string()))
+                } else if other.starts_with('<') {
+                    Ok((SizeOp::LessThan, other[1..].to_string()))
+                } else if other.starts_with("==") {
+                    Ok((SizeOp::Equal, other[2..].to_string()))
+                } else if other.starts_with('=') {
+                    Ok((SizeOp::Equal, other[1..].to_string()))
+                } else {
+                    Ok((SizeOp::Equal, other.to_string()))
+                }
+            }
+        }
+    }
+}
+
+pub fn parse_filter(input: &str) -> Result<FilterExpr, String> {
+    let input_trimmed = input.trim();
+    if input_trimmed.is_empty() {
+        return Ok(FilterExpr::Any);
+    }
+    let tokens = tokenize(input_trimmed);
+    if tokens.is_empty() {
+        return Ok(FilterExpr::Any);
+    }
+    let mut parser = Parser::new(tokens);
+    let expr = parser.parse_expr()?;
+    if parser.pos < parser.tokens.len() {
+        return Err(format!("Unexpected extra token '{:?}' in filter expression", parser.tokens[parser.pos]));
+    }
+    Ok(expr)
+}
+
+// --- CLI HELP & PRINT UTILITIES ---
 
 fn print_help() {
     println!(
@@ -32,22 +411,23 @@ OUTPUT FORMAT OPTIONS:
     --save, -s <FILE.pcap>   Save raw live captured packets to a PCAP file
 
 FILTERING OPTIONS:
-    --filter, -f <TYPE>      Apply traffic filter:
-                             - tcp        Isolate TCP packets (Protocol 6)
-                             - udp        Isolate UDP packets (Protocol 17)
-                             - icmp       Isolate ICMP packets (Protocol 1)
-                             - port <P>   Isolate packets with Source/Dst Port P
-                             - ip <ADDR>  Isolate packets with Source/Dst IPv4 ADDR
+    --filter, -f <EXPR>      Apply advanced packet filter expression:
+                             - tcp / udp / icmp           Isolate specific protocol
+                             - src <IP> / dst <IP>        Isolate source/destination IPv4
+                             - sport <P> / dport <P>      Isolate source/destination Port
+                             - port <P> / ip <ADDR>       Isolate general Port / IPv4
+                             - size > <N> / size < <N>    Isolate packets by size threshold
+                             - COMBINATIONS: "tcp and port 443", "udp and dport 53", "src 10.0.2.15"
 
 MISCELLANEOUS:
     --help, -h               Display this help banner and exit
 
 EXAMPLES:
-    packet-sniffer-engine --interface enp0s3
-    packet-sniffer-engine --interface enp0s3 --filter tcp --json
-    packet-sniffer-engine --interface enp0s3 --save capture.pcap
-    packet-sniffer-engine --read capture.pcap --filter ip 8.8.8.8
-================================================================================"#
+    packet-sniffer-engine --interface enp0s3 --filter "tcp and port 443"
+    packet-sniffer-engine --interface enp0s3 --filter "udp and port 53" --json
+    packet-sniffer-engine --interface enp0s3 --filter "src 10.0.2.15 and size > 100"
+    packet-sniffer-engine --read capture.pcap --filter "port 80 or port 443"
+==============================================================================="#
     );
 }
 
@@ -138,7 +518,6 @@ fn print_hex_dump(data: &[u8], max_bytes: usize) {
     }
 }
 
-// Write to stdout safely; exit cleanly on SIGPIPE (when downstream reader closes pipe)
 fn safe_println(msg: &str) {
     let stdout = io::stdout();
     let mut handle = stdout.lock();
@@ -147,11 +526,13 @@ fn safe_println(msg: &str) {
     }
 }
 
+// --- MAIN ENGINE FUNCTION ---
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
     let mut interface_name = String::new();
-    let mut filter = PacketFilter::None;
+    let mut filter_expr = FilterExpr::Any;
     let mut json_mode = false;
     let mut save_path: Option<String> = None;
     let mut read_path: Option<String> = None;
@@ -195,45 +576,28 @@ fn main() {
             }
             "--filter" | "-f" => {
                 if i + 1 < args.len() {
-                    let filter_type = args[i + 1].to_lowercase();
+                    let mut filter_raw = args[i + 1].clone();
                     i += 1;
-                    match filter_type.as_str() {
-                        "tcp" => filter = PacketFilter::Protocol(6),
-                        "udp" => filter = PacketFilter::Protocol(17),
-                        "icmp" => filter = PacketFilter::Protocol(1),
-                        "port" => {
-                            if i < args.len() {
-                                if let Ok(port) = args[i].parse::<u16>() {
-                                    filter = PacketFilter::Port(port);
-                                } else {
-                                    eprintln!("[!] Error: Invalid port number '{}'. Must be an integer 1-65535.", args[i]);
-                                    process::exit(1);
-                                }
-                            } else {
-                                eprintln!("[!] Error: '--filter port' requires a port number argument.");
-                                process::exit(1);
-                            }
-                        }
-                        "ip" => {
-                            if i < args.len() {
-                                if let Ok(ip) = Ipv4Addr::from_str(&args[i]) {
-                                    filter = PacketFilter::Ip(ip);
-                                } else {
-                                    eprintln!("[!] Error: Invalid IPv4 address '{}'. Example format: 8.8.8.8", args[i]);
-                                    process::exit(1);
-                                }
-                            } else {
-                                eprintln!("[!] Error: '--filter ip' requires an IP address argument.");
-                                process::exit(1);
-                            }
-                        }
-                        _ => {
-                            eprintln!("[!] Error: Unknown filter mode '{}'. Valid options: tcp, udp, icmp, port <PORT>, ip <IP>", filter_type);
+                    // Handle multi-token positional flags like "--filter port 443" or "--filter ip 8.8.8.8"
+                    if (filter_raw.to_lowercase() == "port" || filter_raw.to_lowercase() == "ip"
+                        || filter_raw.to_lowercase() == "src" || filter_raw.to_lowercase() == "dst"
+                        || filter_raw.to_lowercase() == "sport" || filter_raw.to_lowercase() == "dport"
+                        || filter_raw.to_lowercase() == "size") && i < args.len()
+                    {
+                        filter_raw.push(' ');
+                        filter_raw.push_str(&args[i]);
+                        i += 1;
+                    }
+
+                    match parse_filter(&filter_raw) {
+                        Ok(e) => filter_expr = e,
+                        Err(err) => {
+                            eprintln!("[!] Error parsing filter expression '{}': {}", filter_raw, err);
                             process::exit(1);
                         }
                     }
                 } else {
-                    eprintln!("[!] Error: Option '--filter' requires a filter type argument.");
+                    eprintln!("[!] Error: Option '--filter' requires a filter expression argument.");
                     process::exit(1);
                 }
             }
@@ -248,7 +612,6 @@ fn main() {
         process::exit(1);
     }
 
-    // Open Live Capture or Offline PCAP file
     let mut cap_live: Option<Capture<pcap::Active>> = None;
     let mut cap_offline: Option<Capture<pcap::Offline>> = None;
 
@@ -283,18 +646,12 @@ fn main() {
     }
 
     if !json_mode {
-        match &filter {
-            PacketFilter::None => println!("[+] Active Filter: NONE (Capturing All Traffic)"),
-            PacketFilter::Protocol(p) => println!("[+] Active Filter: PROTOCOL -> {} ({})", protocol_name(*p), p),
-            PacketFilter::Port(p) => println!("[+] Active Filter: PORT -> {}", p),
-            PacketFilter::Ip(ip) => println!("[+] Active Filter: IP ADDRESS -> {}", ip),
-        }
+        println!("[+] Active Filter: {}", filter_expr);
         if let Some(ref s_path) = save_path {
             println!("[+] Saving live capture to PCAP file: {}...", s_path);
         }
     }
 
-    // Initialize Savefile if --save is enabled for live capture
     let mut savefile = if let (Some(ref s_path), Some(ref mut c_live)) = (&save_path, &mut cap_live) {
         match c_live.savefile(s_path) {
             Ok(sf) => Some(sf),
@@ -334,7 +691,6 @@ fn main() {
         packet_count += 1;
         let data = &data_bytes[..];
 
-        // Write raw packet to PCAP savefile if enabled
         if let Some(ref mut sf) = savefile {
             if let Some(ref pkt) = save_pkt {
                 sf.write(pkt);
@@ -352,7 +708,6 @@ fn main() {
                 ip_start = 18;
             }
 
-            let mut matches_filter = false;
             let mut src_ip_opt = None;
             let mut dst_ip_opt = None;
             let mut protocol_opt = None;
@@ -407,26 +762,18 @@ fn main() {
                 }
             }
 
-            match &filter {
-                PacketFilter::None => matches_filter = true,
-                PacketFilter::Protocol(proto) => {
-                    if let Some(p) = protocol_opt {
-                        if p == *proto { matches_filter = true; }
-                    }
-                }
-                PacketFilter::Port(port) => {
-                    if let (Some(sp), Some(dp)) = (src_port_opt, dst_port_opt) {
-                        if sp == *port || dp == *port { matches_filter = true; }
-                    }
-                }
-                PacketFilter::Ip(ip) => {
-                    if let (Some(sip), Some(dip)) = (src_ip_opt, dst_ip_opt) {
-                        if sip == *ip || dip == *ip { matches_filter = true; }
-                    }
-                }
-            }
+            // EVALUATE ADVANCED FILTER AST
+            let matches = filter_expr.matches(
+                data.len(),
+                ether_type,
+                src_ip_opt,
+                dst_ip_opt,
+                protocol_opt,
+                src_port_opt,
+                dst_port_opt,
+            );
 
-            if !matches_filter {
+            if !matches {
                 continue;
             }
 
@@ -534,80 +881,64 @@ fn main() {
     }
 }
 
+// --- UNIT TESTS ---
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_format_mac() {
-        let mac_bytes = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
-        assert_eq!(format_mac(&mac_bytes), "00:11:22:33:44:55");
+    fn test_parse_filter_simple() {
+        assert_eq!(parse_filter("tcp").unwrap(), FilterExpr::Match(FilterCondition::Protocol(6)));
+        assert_eq!(parse_filter("udp").unwrap(), FilterExpr::Match(FilterCondition::Protocol(17)));
+        assert_eq!(parse_filter("icmp").unwrap(), FilterExpr::Match(FilterCondition::Protocol(1)));
     }
 
     #[test]
-    fn test_protocol_name() {
-        assert_eq!(protocol_name(1), "ICMP");
-        assert_eq!(protocol_name(6), "TCP");
-        assert_eq!(protocol_name(17), "UDP");
-        assert_eq!(protocol_name(41), "IPv6-Encaps");
-        assert_eq!(protocol_name(89), "OSPF");
-        assert_eq!(protocol_name(255), "OTHER");
+    fn test_parse_filter_ip_and_ports() {
+        let ip = Ipv4Addr::new(192, 168, 1, 10);
+        assert_eq!(parse_filter("src 192.168.1.10").unwrap(), FilterExpr::Match(FilterCondition::SrcIp(ip)));
+        assert_eq!(parse_filter("dst 192.168.1.10").unwrap(), FilterExpr::Match(FilterCondition::DstIp(ip)));
+        assert_eq!(parse_filter("port 443").unwrap(), FilterExpr::Match(FilterCondition::Port(443)));
+        assert_eq!(parse_filter("sport 80").unwrap(), FilterExpr::Match(FilterCondition::SrcPort(80)));
+        assert_eq!(parse_filter("dport 53").unwrap(), FilterExpr::Match(FilterCondition::DstPort(53)));
     }
 
     #[test]
-    fn test_port_service() {
-        assert_eq!(port_service(22), "SSH");
-        assert_eq!(port_service(53), "DNS");
-        assert_eq!(port_service(80), "HTTP");
-        assert_eq!(port_service(443), "HTTPS");
-        assert_eq!(port_service(9999), "CUSTOM");
+    fn test_parse_filter_size() {
+        assert_eq!(parse_filter("size > 100").unwrap(), FilterExpr::Match(FilterCondition::PacketSize(SizeOp::GreaterThan, 100)));
+        assert_eq!(parse_filter("size <= 500").unwrap(), FilterExpr::Match(FilterCondition::PacketSize(SizeOp::LessThanOrEqual, 500)));
     }
 
     #[test]
-    fn test_parse_tcp_flags() {
-        assert_eq!(parse_tcp_flags(0x02), "SYN");
-        assert_eq!(parse_tcp_flags(0x12), "SYN|ACK");
-        assert_eq!(parse_tcp_flags(0x01), "FIN");
-        assert_eq!(parse_tcp_flags(0x04), "RST");
-        assert_eq!(parse_tcp_flags(0x00), "NONE");
+    fn test_parse_filter_combinations() {
+        let expr = parse_filter("tcp and port 443").unwrap();
+        assert_eq!(
+            expr,
+            FilterExpr::And(
+                Box::new(FilterExpr::Match(FilterCondition::Protocol(6))),
+                Box::new(FilterExpr::Match(FilterCondition::Port(443)))
+            )
+        );
+
+        let expr_not = parse_filter("not icmp").unwrap();
+        assert_eq!(
+            expr_not,
+            FilterExpr::Not(Box::new(FilterExpr::Match(FilterCondition::Protocol(1))))
+        );
     }
 
     #[test]
-    fn test_icmp_type_name() {
-        assert_eq!(icmp_type_name(0), "Echo Reply");
-        assert_eq!(icmp_type_name(8), "Echo Request");
-        assert_eq!(icmp_type_name(3), "Dst Unreachable");
-        assert_eq!(icmp_type_name(99), "ICMP Other");
-    }
+    fn test_filter_evaluation() {
+        let expr = parse_filter("tcp and port 443").unwrap();
+        let src_ip = Some(Ipv4Addr::new(10, 0, 2, 15));
+        let dst_ip = Some(Ipv4Addr::new(8, 8, 8, 8));
 
-    #[test]
-    fn test_hex_encode() {
-        let data = [0xDE, 0xAD, 0xBE, 0xEF];
-        assert_eq!(hex_encode(&data, 4), "DE AD BE EF");
-        assert_eq!(hex_encode(&data, 2), "DE AD");
-    }
-
-    #[test]
-    fn test_ethernet_ipv4_parsing() {
-        // Construct mock 34-byte Ethernet + IPv4 ICMP packet
-        let pkt = vec![
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, // Dst MAC
-            0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, // Src MAC
-            0x08, 0x00,                         // EtherType: IPv4
-            0x45, 0x00, 0x00, 0x54, 0x1A, 0x2B, 0x40, 0x00,
-            0x40, 0x01, 0xBD, 0x37,             // TTL: 64, Protocol: 1 (ICMP)
-            10, 0, 2, 15,                       // Src IP: 10.0.2.15
-            8, 8, 8, 8                          // Dst IP: 8.8.8.8
-        ];
-
-        assert!(pkt.len() >= 14);
-        let ether_type = u16::from_be_bytes([pkt[12], pkt[13]]);
-        assert_eq!(ether_type, 0x0800);
-
-        let src_ip = Ipv4Addr::new(pkt[26], pkt[27], pkt[28], pkt[29]);
-        let dst_ip = Ipv4Addr::new(pkt[30], pkt[31], pkt[32], pkt[33]);
-        assert_eq!(src_ip.to_string(), "10.0.2.15");
-        assert_eq!(dst_ip.to_string(), "8.8.8.8");
+        // Matches HTTPS TCP packet
+        assert!(expr.matches(100, 0x0800, src_ip, dst_ip, Some(6), Some(50000), Some(443)));
+        // Fails UDP packet on port 443
+        assert!(!expr.matches(100, 0x0800, src_ip, dst_ip, Some(17), Some(50000), Some(443)));
+        // Fails TCP packet on port 80
+        assert!(!expr.matches(100, 0x0800, src_ip, dst_ip, Some(6), Some(50000), Some(80)));
     }
 }
-
