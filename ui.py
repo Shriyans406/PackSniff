@@ -188,15 +188,74 @@ def build_ratio_bar(metrics):
 
     return Text.assemble(bar_text, legend)
 
+class FlowTracker:
+    def __init__(self):
+        self.flows = {}
+
+    def update(self, p):
+        src_ip = p.get("src")
+        dst_ip = p.get("dst")
+        src_port = p.get("src_port")
+        dst_port = p.get("dst_port")
+        proto = p.get("proto", "OTHER")
+        length = p.get("len", 0)
+        l4_info = p.get("l4_info", "")
+
+        if not src_ip or not dst_ip or src_port is None or dst_port is None:
+            return
+
+        if (src_ip, src_port) <= (dst_ip, dst_port):
+            key = (src_ip, src_port, dst_ip, dst_port, proto)
+            is_fwd = True
+        else:
+            key = (dst_ip, dst_port, src_ip, src_port, proto)
+            is_fwd = False
+
+        now = time.time()
+        if key not in self.flows:
+            initial_state = "SYN_SENT" if "SYN" in l4_info else ("ESTABLISHED" if proto == "TCP" else "ACTIVE")
+            self.flows[key] = {
+                "start": now,
+                "last": now,
+                "pkts_fwd": 0, "pkts_rev": 0,
+                "bytes_fwd": 0, "bytes_rev": 0,
+                "state": initial_state,
+                "src_ip": key[0], "src_port": key[1],
+                "dst_ip": key[2], "dst_port": key[3],
+                "proto": proto
+            }
+
+        f = self.flows[key]
+        f["last"] = now
+        if is_fwd:
+            f["pkts_fwd"] += 1
+            f["bytes_fwd"] += length
+        else:
+            f["pkts_rev"] += 1
+            f["bytes_rev"] += length
+
+        if proto == "TCP":
+            if "RST" in l4_info:
+                f["state"] = "RESET"
+            elif "FIN" in l4_info:
+                f["state"] = "FIN_WAIT"
+            elif "ACK" in l4_info and f["state"] == "SYN_SENT":
+                f["state"] = "ESTABLISHED"
+
+    def get_recent_flows(self, limit=4):
+        sorted_flows = sorted(self.flows.values(), key=lambda x: x["last"], reverse=True)
+        return sorted_flows[:limit]
+
 def format_mini_bar(share_pct, width=10):
     fill = int(round((share_pct / 100.0) * width))
     empty = width - fill
     return f"[bold magenta]{'█' * fill}[/][dim]{'░' * empty}[/]"
 
-def create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats):
+def create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats, flow_tracker):
     rates = bw_tracker.current_rates()
     uptime_str = format_duration(time.time() - bw_tracker.start_time)
     resolved_count = len(dns_cache)
+    active_flows_count = len(flow_tracker.flows)
 
     layout = Layout()
     layout.split(
@@ -212,7 +271,7 @@ def create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats):
         f"[bold bright_white]LIVE SPEED:[/] [bold bright_cyan]{rates['kbs']:>6.2f} KB/s[/] [dim]({rates['mbits']:>4.2f} Mbit/s)[/] │ "
         f"[bold bright_white]RATE:[/] [bold bright_green]{rates['pps']:>4.0f} pkts/s[/] │ "
         f"[bold bright_white]PEAK:[/] [bold magenta]{rates['peak_kbs']:>6.2f} KB/s[/] │ "
-        f"[bold bright_white]AVG:[/] [bold bright_yellow]{rates['avg_kbs']:>6.2f} KB/s[/] │ "
+        f"[bold bright_white]ACTIVE FLOWS:[/] [bold bright_yellow]{active_flows_count}[/] │ "
         f"[bold bright_white]TOTAL:[/] [bold bright_white]{format_bytes(metrics['bytes'])}[/] [dim]({metrics['total']:,} pkts)[/]\n"
         f"[bold dim]STATUS:[/] [bold green]🟢 STREAMING[/] │ [bold dim]RESOLVED DOMAINS:[/] [bold cyan]{resolved_count}[/] │ [bold dim]SESSION DURATION:[/] [bold yellow]{uptime_str}[/]"
     )
@@ -220,18 +279,23 @@ def create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats):
     header_content = Text.assemble(header_title, "\n", Text.from_markup(gauge_markup, justify="center"))
     layout["header"].update(Panel(header_content, box=box.ROUNDED, style="bright_blue"))
 
-    # --- 2. Main Split: Packet Stream Table (Left) & Top Talkers (Right) ---
+    # --- 2. Main Split: Packet Stream (Left) & Right Side (Top Talkers + Active Flows) ---
     layout["main"].split_row(
         Layout(name="stream", ratio=7),
-        Layout(name="top_talkers", ratio=4)
+        Layout(name="right_side", ratio=5)
+    )
+
+    layout["right_side"].split(
+        Layout(name="top_talkers", ratio=1),
+        Layout(name="flows", ratio=1)
     )
 
     # Live Packet Table
     stream_table = Table(expand=True, box=box.SIMPLE_HEAD, pad_edge=False)
     stream_table.add_column("#", style="dim", width=5, justify="right")
     stream_table.add_column("Proto", width=8, justify="center")
-    stream_table.add_column("Source Host / Port", width=26)
-    stream_table.add_column("Destination Host / Port", width=26)
+    stream_table.add_column("Source Host / Port", width=24)
+    stream_table.add_column("Destination Host / Port", width=24)
     stream_table.add_column("Size", width=8, justify="right")
     stream_table.add_column("L4 Details & Control Flags", style="italic")
 
@@ -271,7 +335,6 @@ def create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats):
             dst_str += f" [dim]({dst_service})[/]"
 
         l4 = p.get("l4_info", "")
-        # Format control flag highlights
         l4_formatted = (
             l4.replace("SYN", "[bold bright_green]SYN[/]")
               .replace("ACK", "[bold bright_cyan]ACK[/]")
@@ -298,14 +361,13 @@ def create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats):
     talkers_table.add_column("Volume", justify="right", style="bright_yellow")
     talkers_table.add_column("Share", justify="center")
 
-    sorted_ips = sorted(ip_stats.items(), key=lambda x: x[1]["bytes"], reverse=True)[:6]
+    sorted_ips = sorted(ip_stats.items(), key=lambda x: x[1]["bytes"], reverse=True)[:4]
     total_vol = max(metrics["bytes"], 1)
 
     for ip, stat in sorted_ips:
         share_pct = (stat["bytes"] / total_vol) * 100
         domain_lbl = get_label(ip)
         
-        # Add host type badge icon
         if ip in ("8.8.8.8", "8.8.4.4", "1.1.1.1", "9.9.9.9"):
             icon = "🌐 "
         elif ip in ("10.0.2.15", "127.0.0.1"):
@@ -323,7 +385,47 @@ def create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats):
         )
 
     layout["top_talkers"].update(
-        Panel(talkers_table, title="[bold bright_white]📊 Top Talkers & Domain Bandwidth Share[/]", box=box.ROUNDED, border_style="magenta")
+        Panel(talkers_table, title="[bold bright_white]📊 Top Talkers & Domain Share[/]", box=box.ROUNDED, border_style="magenta")
+    )
+
+    # Active Flow Conversations Panel
+    flows_table = Table(expand=True, box=box.SIMPLE_HEAD, pad_edge=False)
+    flows_table.add_column("Flow 5-Tuple", style="bold bright_white")
+    flows_table.add_column("Pkts", justify="right", style="cyan")
+    flows_table.add_column("Volume", justify="right", style="yellow")
+    flows_table.add_column("Dur", justify="right", style="green")
+    flows_table.add_column("State", justify="center")
+
+    for f in flow_tracker.get_recent_flows(4):
+        s_lbl = get_short_domain(f["src_ip"])
+        d_lbl = get_short_domain(f["dst_ip"])
+        flow_name = f"{s_lbl}:{f['src_port']}➔{d_lbl}:{f['dst_port']}"
+        total_pkts = f["pkts_fwd"] + f["pkts_rev"]
+        total_bytes = f["bytes_fwd"] + f["bytes_rev"]
+        dur = f"{f['last'] - f['start']:.1f}s"
+        
+        st = f["state"]
+        if st == "ESTABLISHED":
+            badge = "[bold green]ESTAB[/]"
+        elif st == "SYN_SENT":
+            badge = "[bold yellow]SYN[/]"
+        elif st == "RESET":
+            badge = "[bold red]RESET[/]"
+        elif st == "FIN_WAIT":
+            badge = "[bold magenta]FIN[/]"
+        else:
+            badge = "[bold cyan]ACTV[/]"
+
+        flows_table.add_row(
+            flow_name,
+            f"{total_pkts}",
+            format_bytes(total_bytes),
+            dur,
+            badge
+        )
+
+    layout["flows"].update(
+        Panel(flows_table, title="[bold bright_white]🔗 Active Flow Conversations (Phase 12)[/]", box=box.ROUNDED, border_style="yellow")
     )
 
     # --- 3. Footer: Protocol Distribution Bar & Deep Packet Inspector ---
@@ -340,7 +442,7 @@ def create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats):
 
     footer_content = Text.assemble(ratio_element, "\n", inspector_text)
     
-    status_bar = "[dim white] Press [bold bright_yellow]Ctrl+C[/] to exit │ [bold cyan]JSON Pipe[/] Connected │ [bold green]Live Promiscuous Sniffing[/][/]"
+    status_bar = "[dim white] Press [bold bright_yellow]Ctrl+C[/] to exit │ [bold cyan]JSON Pipe[/] Connected │ [bold green]Live Flow Telemetry[/][/]"
     
     layout["footer"].update(
         Panel(footer_content, title="[bold bright_white]🔬 Protocol Distribution & Deep Packet Inspector[/]", subtitle=status_bar, box=box.ROUNDED, border_style="green")
@@ -353,9 +455,10 @@ def main():
     metrics = {"total": 0, "tcp": 0, "udp": 0, "icmp": 0, "other": 0, "bytes": 0}
     ip_stats = defaultdict(lambda: {"pkts": 0, "bytes": 0})
     bw_tracker = BandwidthTracker()
+    flow_tracker = FlowTracker()
     latest_packet = None
 
-    with Live(create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats), refresh_per_second=4, console=console) as live:
+    with Live(create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats, flow_tracker), refresh_per_second=4, console=console) as live:
         for line in sys.stdin:
             line = line.strip()
             if not line or not line.startswith("{"):
@@ -370,6 +473,7 @@ def main():
                 metrics["bytes"] += pkt_len
 
                 bw_tracker.add_packet(pkt_len)
+                flow_tracker.update(p)
 
                 src_ip = p.get("src")
                 dst_ip = p.get("dst")
@@ -392,7 +496,7 @@ def main():
                 else:
                     metrics["other"] += 1
 
-                live.update(create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats))
+                live.update(create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats, flow_tracker))
             except json.JSONDecodeError:
                 continue
 

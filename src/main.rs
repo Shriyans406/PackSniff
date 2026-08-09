@@ -4,6 +4,7 @@ use std::io::{self, Write};
 use std::net::Ipv4Addr;
 use std::process;
 use std::str::FromStr;
+use std::collections::HashMap;
 
 // --- ADVANCED PACKET FILTERING AST DATA STRUCTURES ---
 
@@ -104,6 +105,43 @@ impl std::fmt::Display for FilterExpr {
             FilterExpr::Not(sub) => write!(f, "NOT ({})", sub),
         }
     }
+}
+
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct FlowKey {
+    pub ip_a: Ipv4Addr,
+    pub port_a: u16,
+    pub ip_b: Ipv4Addr,
+    pub port_b: u16,
+    pub protocol: u8,
+}
+
+impl FlowKey {
+    pub fn canonical(src_ip: Ipv4Addr, src_port: u16, dst_ip: Ipv4Addr, dst_port: u16, proto: u8) -> (Self, bool) {
+        if (src_ip, src_port) <= (dst_ip, dst_port) {
+            (
+                FlowKey { ip_a: src_ip, port_a: src_port, ip_b: dst_ip, port_b: dst_port, protocol: proto },
+                true, // Forward direction
+            )
+        } else {
+            (
+                FlowKey { ip_a: dst_ip, port_a: dst_port, ip_b: src_ip, port_b: src_port, protocol: proto },
+                false, // Reverse direction
+            )
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FlowStats {
+    pub pkts_fwd: u64,
+    pub pkts_rev: u64,
+    pub bytes_fwd: u64,
+    pub bytes_rev: u64,
+    pub first_seen: std::time::Instant,
+    pub last_seen: std::time::Instant,
+    pub tcp_state: String,
 }
 
 // --- LEXER & PARSER FOR FILTER EXPRESSIONS ---
@@ -409,6 +447,7 @@ CAPTURE SOURCE OPTIONS (Required):
 OUTPUT FORMAT OPTIONS:
     --json, -j               Output line-delimited JSON stream for TUI presenter
     --save, -s <FILE.pcap>   Save raw live captured packets to a PCAP file
+    --flows                  Print stateful connection / flow analysis summary table on exit
 
 FILTERING OPTIONS:
     --filter, -f <EXPR>      Apply advanced packet filter expression:
@@ -534,6 +573,7 @@ fn main() {
     let mut interface_name = String::new();
     let mut filter_expr = FilterExpr::Any;
     let mut json_mode = false;
+    let mut flow_mode = false;
     let mut save_path: Option<String> = None;
     let mut read_path: Option<String> = None;
 
@@ -543,6 +583,9 @@ fn main() {
             "--help" | "-h" => {
                 print_help();
                 process::exit(0);
+            }
+            "--flows" => {
+                flow_mode = true;
             }
             "--interface" | "-i" => {
                 if i + 1 < args.len() {
@@ -666,6 +709,7 @@ fn main() {
 
     let mut packet_count: u64 = 0;
     let mut matched_count: u64 = 0;
+    let mut flows: HashMap<FlowKey, FlowStats> = HashMap::new();
 
     loop {
         let (data_bytes, save_pkt) = if let Some(ref mut c_live) = cap_live {
@@ -779,6 +823,41 @@ fn main() {
 
             matched_count += 1;
 
+            if let (Some(s_ip), Some(d_ip), Some(s_port), Some(d_port), Some(proto)) =
+                (src_ip_opt, dst_ip_opt, src_port_opt, dst_port_opt, protocol_opt)
+            {
+                let (key, is_fwd) = FlowKey::canonical(s_ip, s_port, d_ip, d_port, proto);
+                let now = std::time::Instant::now();
+                let entry = flows.entry(key).or_insert_with(|| FlowStats {
+                    pkts_fwd: 0,
+                    pkts_rev: 0,
+                    bytes_fwd: 0,
+                    bytes_rev: 0,
+                    first_seen: now,
+                    last_seen: now,
+                    tcp_state: if proto == 6 { "SYN_SENT".to_string() } else { "ACTIVE".to_string() },
+                });
+
+                entry.last_seen = now;
+                if is_fwd {
+                    entry.pkts_fwd += 1;
+                    entry.bytes_fwd += data.len() as u64;
+                } else {
+                    entry.pkts_rev += 1;
+                    entry.bytes_rev += data.len() as u64;
+                }
+
+                if proto == 6 {
+                    if l4_info.contains("RST") {
+                        entry.tcp_state = "RESET".to_string();
+                    } else if l4_info.contains("FIN") {
+                        entry.tcp_state = "FIN_WAIT".to_string();
+                    } else if l4_info.contains("ACK") && entry.tcp_state == "SYN_SENT" {
+                        entry.tcp_state = "ESTABLISHED".to_string();
+                    }
+                }
+            }
+
             if json_mode {
                 let proto_str = match protocol_opt {
                     Some(p) => protocol_name(p),
@@ -878,6 +957,23 @@ fn main() {
 
     if !json_mode {
         println!("\n[+] Finished processing packets. Matched: {}, Total Processed: {}", matched_count, packet_count);
+        if flow_mode || !flows.is_empty() {
+            println!("\n================================================================================");
+            println!("  🔗 PACKSNIFF STATEFUL FLOW TRACKER — CONNECTION CONVERSATIONS ({})", flows.len());
+            println!("================================================================================");
+            println!("{:<45} {:<15} {:<15} {:<10} {:<12}", "FLOW 5-TUPLE", "PKTS (Tx/Rx)", "BYTES (Tx/Rx)", "DURATION", "STATE");
+            println!("--------------------------------------------------------------------------------");
+            for (key, stat) in &flows {
+                let duration_sec = stat.last_seen.duration_since(stat.first_seen).as_secs_f64();
+                let proto_str = protocol_name(key.protocol);
+                let flow_str = format!("{}:{} -> {}:{} ({})", key.ip_a, key.port_a, key.ip_b, key.port_b, proto_str);
+                let pkts_str = format!("{} / {}", stat.pkts_fwd, stat.pkts_rev);
+                let bytes_str = format!("{} B / {} B", stat.bytes_fwd, stat.bytes_rev);
+                let dur_str = format!("{:.1}s", duration_sec);
+                println!("{:<45} {:<15} {:<15} {:<10} {:<12}", flow_str, pkts_str, bytes_str, dur_str, stat.tcp_state);
+            }
+            println!("================================================================================");
+        }
     }
 }
 
@@ -940,5 +1036,16 @@ mod tests {
         assert!(!expr.matches(100, 0x0800, src_ip, dst_ip, Some(17), Some(50000), Some(443)));
         // Fails TCP packet on port 80
         assert!(!expr.matches(100, 0x0800, src_ip, dst_ip, Some(6), Some(50000), Some(80)));
+    }
+
+    #[test]
+    fn test_flow_canonical_key() {
+        let ip1 = Ipv4Addr::new(192, 168, 1, 5);
+        let ip2 = Ipv4Addr::new(142, 250, 80, 14);
+        let (key1, is_fwd1) = FlowKey::canonical(ip1, 52143, ip2, 443, 6);
+        let (key2, is_fwd2) = FlowKey::canonical(ip2, 443, ip1, 52143, 6);
+
+        assert_eq!(key1, key2);
+        assert_ne!(is_fwd1, is_fwd2);
     }
 }
