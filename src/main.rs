@@ -509,6 +509,18 @@ fn port_service(port: u16) -> &'static str {
     }
 }
 
+fn format_bytes_rust(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
 fn parse_tcp_flags(flags: u8) -> String {
     let mut active = Vec::new();
     if flags & 0x01 != 0 { active.push("FIN"); }
@@ -695,13 +707,25 @@ fn main() {
         }
     }
 
-    let mut savefile = if let (Some(ref s_path), Some(ref mut c_live)) = (&save_path, &mut cap_live) {
-        match c_live.savefile(s_path) {
-            Ok(sf) => Some(sf),
-            Err(e) => {
-                eprintln!("[!] Failed to create savefile '{}': {}", s_path, e);
-                process::exit(1);
+    let mut savefile = if let Some(ref s_path) = save_path {
+        if let Some(ref mut c_live) = cap_live {
+            match c_live.savefile(s_path) {
+                Ok(sf) => Some(sf),
+                Err(e) => {
+                    eprintln!("[!] Failed to create savefile '{}': {}", s_path, e);
+                    process::exit(1);
+                }
             }
+        } else if let Some(ref mut c_off) = cap_offline {
+            match c_off.savefile(s_path) {
+                Ok(sf) => Some(sf),
+                Err(e) => {
+                    eprintln!("[!] Failed to create savefile '{}': {}", s_path, e);
+                    process::exit(1);
+                }
+            }
+        } else {
+            None
         }
     } else {
         None
@@ -724,7 +748,7 @@ fn main() {
             match c_off.next_packet() {
                 Ok(packet) => {
                     let b = packet.data.to_vec();
-                    (b, None)
+                    (b, Some(packet))
                 }
                 Err(_) => break,
             }
@@ -958,21 +982,33 @@ fn main() {
     if !json_mode {
         println!("\n[+] Finished processing packets. Matched: {}, Total Processed: {}", matched_count, packet_count);
         if flow_mode || !flows.is_empty() {
-            println!("\n================================================================================");
+            println!("\n====================================================================================================");
             println!("  🔗 PACKSNIFF STATEFUL FLOW TRACKER — CONNECTION CONVERSATIONS ({})", flows.len());
-            println!("================================================================================");
-            println!("{:<45} {:<15} {:<15} {:<10} {:<12}", "FLOW 5-TUPLE", "PKTS (Tx/Rx)", "BYTES (Tx/Rx)", "DURATION", "STATE");
-            println!("--------------------------------------------------------------------------------");
+            println!("====================================================================================================");
+            println!("{:<48} {:<16} {:<24} {:<10} {:<12}", "FLOW 5-TUPLE", "PKTS (Tx/Rx)", "BYTES (Tx/Rx)", "DURATION", "STATE");
+            println!("----------------------------------------------------------------------------------------------------");
             for (key, stat) in &flows {
                 let duration_sec = stat.last_seen.duration_since(stat.first_seen).as_secs_f64();
                 let proto_str = protocol_name(key.protocol);
-                let flow_str = format!("{}:{} -> {}:{} ({})", key.ip_a, key.port_a, key.ip_b, key.port_b, proto_str);
-                let pkts_str = format!("{} / {}", stat.pkts_fwd, stat.pkts_rev);
-                let bytes_str = format!("{} B / {} B", stat.bytes_fwd, stat.bytes_rev);
+                let svc_a = port_service(key.port_a);
+                let svc_b = port_service(key.port_b);
+                let svc_name = if svc_a != "CUSTOM" {
+                    svc_a
+                } else if svc_b != "CUSTOM" {
+                    svc_b
+                } else {
+                    proto_str
+                };
+
+                let flow_str = format!("{}:{} -> {}:{} ({})", key.ip_a, key.port_a, key.ip_b, key.port_b, svc_name);
+                let total_pkts = stat.pkts_fwd + stat.pkts_rev;
+                let pkts_str = format!("{} ({} / {})", total_pkts, stat.pkts_fwd, stat.pkts_rev);
+                let total_bytes = stat.bytes_fwd + stat.bytes_rev;
+                let bytes_str = format!("{} ({} / {})", format_bytes_rust(total_bytes), format_bytes_rust(stat.bytes_fwd), format_bytes_rust(stat.bytes_rev));
                 let dur_str = format!("{:.1}s", duration_sec);
-                println!("{:<45} {:<15} {:<15} {:<10} {:<12}", flow_str, pkts_str, bytes_str, dur_str, stat.tcp_state);
+                println!("{:<48} {:<16} {:<24} {:<10} {:<12}", flow_str, pkts_str, bytes_str, dur_str, stat.tcp_state);
             }
-            println!("================================================================================");
+            println!("====================================================================================================");
         }
     }
 }

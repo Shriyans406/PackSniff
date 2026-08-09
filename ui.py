@@ -391,17 +391,25 @@ def create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats, flow
     # Active Flow Conversations Panel
     flows_table = Table(expand=True, box=box.SIMPLE_HEAD, pad_edge=False)
     flows_table.add_column("Flow 5-Tuple", style="bold bright_white")
-    flows_table.add_column("Pkts", justify="right", style="cyan")
-    flows_table.add_column("Volume", justify="right", style="yellow")
+    flows_table.add_column("Pkts (Tx/Rx)", justify="right", style="cyan")
+    flows_table.add_column("Volume (Tx/Rx)", justify="right", style="yellow")
     flows_table.add_column("Dur", justify="right", style="green")
     flows_table.add_column("State", justify="center")
 
     for f in flow_tracker.get_recent_flows(4):
         s_lbl = get_short_domain(f["src_ip"])
         d_lbl = get_short_domain(f["dst_ip"])
-        flow_name = f"{s_lbl}:{f['src_port']}➔{d_lbl}:{f['dst_port']}"
+        s_svc = COMMON_SERVICES.get(f["src_port"], "")
+        d_svc = COMMON_SERVICES.get(f["dst_port"], "")
+        svc_str = f" ({d_svc})" if d_svc else (f" ({s_svc})" if s_svc else f" ({f['proto']})")
+        flow_name = f"{s_lbl}:{f['src_port']}➔{d_lbl}:{f['dst_port']}{svc_str}"
+        
         total_pkts = f["pkts_fwd"] + f["pkts_rev"]
+        pkts_str = f"{total_pkts} ({f['pkts_fwd']}/{f['pkts_rev']})"
+        
         total_bytes = f["bytes_fwd"] + f["bytes_rev"]
+        vol_str = f"{format_bytes(total_bytes)} ({format_bytes(f['bytes_fwd'])}/{format_bytes(f['bytes_rev'])})"
+        
         dur = f"{f['last'] - f['start']:.1f}s"
         
         st = f["state"]
@@ -418,8 +426,8 @@ def create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats, flow
 
         flows_table.add_row(
             flow_name,
-            f"{total_pkts}",
-            format_bytes(total_bytes),
+            pkts_str,
+            vol_str,
             dur,
             badge
         )
