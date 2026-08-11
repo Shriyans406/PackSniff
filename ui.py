@@ -188,6 +188,70 @@ def build_ratio_bar(metrics):
 
     return Text.assemble(bar_text, legend)
 
+class AnomalyDetector:
+    def __init__(self):
+        # Track (src_ip -> set of (dst_port, timestamp))
+        self.port_scan_tracker = defaultdict(list)
+        # Track (src_ip -> count of SYN packets)
+        self.syn_tracker = defaultdict(list)
+        # Suspicious port definitions
+        self.suspicious_ports = {23: "TELNET (Unencrypted)", 4444: "Metasploit Shell", 31337: "Back Orifice", 6667: "IRC Traffic"}
+        # List of active alerts: {"level": "WARNING", "msg": "...", "time": timestamp}
+        self.alerts = []
+
+    def inspect(self, p, current_pps, current_kbs):
+        now = time.time()
+        src_ip = p.get("src")
+        dst_ip = p.get("dst")
+        dst_port = p.get("dst_port")
+        proto = p.get("proto")
+        l4_info = p.get("l4_info", "")
+
+        # 1. Traffic Burst / High Rate Detection
+        if current_pps > 300:
+            self._add_alert("WARNING", f"High Packet Rate Detected: {current_pps:.0f} pkts/sec")
+        if current_kbs > 2048:  # > 2 MB/s
+            self._add_alert("WARNING", f"Traffic Volume Burst Detected: {current_kbs/1024:.2f} MB/s")
+
+        if not src_ip or not dst_port:
+            return
+
+        # 2. Port Scan Detection (10+ distinct ports in 5 seconds)
+        self.port_scan_tracker[src_ip].append((dst_port, now))
+        # Clean old entries (> 5 seconds)
+        self.port_scan_tracker[src_ip] = [item for item in self.port_scan_tracker[src_ip] if now - item[1] <= 5.0]
+        distinct_ports = {item[0] for item in self.port_scan_tracker[src_ip]}
+        if len(distinct_ports) >= 10:
+            self._add_alert(
+                "CRITICAL",
+                f"Possible Port Scan from {src_ip}! {len(distinct_ports)} ports contacted ({len(self.port_scan_tracker[src_ip])} attempts)"
+            )
+
+        # 3. SYN Flood Detection
+        if proto == "TCP" and "SYN" in l4_info and "ACK" not in l4_info:
+            self.syn_tracker[src_ip].append(now)
+            self.syn_tracker[src_ip] = [t for t in self.syn_tracker[src_ip] if now - t <= 3.0]
+            if len(self.syn_tracker[src_ip]) >= 25:
+                self._add_alert("CRITICAL", f"Excessive Connection Attempts / SYN Flood from {src_ip} ({len(self.syn_tracker[src_ip])} SYNs/3s)")
+
+        # 4. Suspicious / Unexpected Port Detection
+        if dst_port in self.suspicious_ports:
+            self._add_alert("WARNING", f"Suspicious Port Activity: {src_ip} ➔ {dst_ip}:{dst_port} ({self.suspicious_ports[dst_port]})")
+
+    def _add_alert(self, level, msg):
+        now_str = time.strftime("%H:%M:%S")
+        full_msg = f"[{now_str}] {msg}"
+        # Deduplicate recent identical alerts
+        if not self.alerts or self.alerts[-1]["msg"] != full_msg:
+            self.alerts.append({"level": level, "msg": full_msg, "time": time.time()})
+            if len(self.alerts) > 10:
+                self.alerts.pop(0)
+
+    def get_recent_alerts(self, limit=4):
+        return self.alerts[-limit:]
+
+
+
 class FlowTracker:
     def __init__(self):
         self.flows = {}
@@ -251,7 +315,7 @@ def format_mini_bar(share_pct, width=10):
     empty = width - fill
     return f"[bold magenta]{'█' * fill}[/][dim]{'░' * empty}[/]"
 
-def create_dashboard(packets, metrics, latest_packet, bw_tracker, src_ip_stats, dst_ip_stats, port_stats, flow_tracker):
+def create_dashboard(packets, metrics, latest_packet, bw_tracker, src_ip_stats, dst_ip_stats, port_stats, flow_tracker, anomaly_detector):
     rates = bw_tracker.current_rates()
     uptime_str = format_duration(time.time() - bw_tracker.start_time)
     resolved_count = len(dns_cache)
@@ -279,15 +343,16 @@ def create_dashboard(packets, metrics, latest_packet, bw_tracker, src_ip_stats, 
     header_content = Text.assemble(header_title, "\n", Text.from_markup(gauge_markup, justify="center"))
     layout["header"].update(Panel(header_content, box=box.ROUNDED, style="bright_blue"))
 
-    # --- 2. Main Split: Packet Stream (Left) & Right Side (Stats + Flows) ---
+    # --- 2. Main Split: Packet Stream (Left) & Right Side (Stats + Alerts + Flows) ---
     layout["main"].split_row(
         Layout(name="stream", ratio=7),
         Layout(name="right_side", ratio=5)
     )
 
     layout["right_side"].split(
-        Layout(name="stats", ratio=1),
-        Layout(name="flows", ratio=1)
+        Layout(name="stats", ratio=2),
+        Layout(name="alerts", ratio=2),
+        Layout(name="flows", ratio=2)
     )
 
     # Live Packet Table
@@ -392,6 +457,26 @@ def create_dashboard(packets, metrics, latest_packet, bw_tracker, src_ip_stats, 
         Panel(stats_table, title="[bold bright_white]📈 NETWORK STATISTICS[/]", box=box.ROUNDED, border_style="magenta")
     )
 
+    # Phase 14 - Security & Anomaly Alerts Panel
+    alerts_table = Table(expand=True, box=box.SIMPLE_HEAD, pad_edge=False, show_header=False)
+    alerts_table.add_column("Level", width=12, justify="center")
+    alerts_table.add_column("Alert Details", style="bold bright_white")
+
+    recent_alerts = anomaly_detector.get_recent_alerts(3)
+    if not recent_alerts:
+        alerts_table.add_row("[bold green]  OK  [/]", "[dim green]No security anomalies detected. System operating normally.[/]")
+    else:
+        for alert in recent_alerts:
+            if alert["level"] == "CRITICAL":
+                lvl_badge = "[bold white on red] CRITICAL [/]"
+            else:
+                lvl_badge = "[bold black on yellow] WARNING  [/]"
+            alerts_table.add_row(lvl_badge, alert["msg"])
+
+    layout["alerts"].update(
+        Panel(alerts_table, title="[bold bright_white]🚨 SECURITY & ANOMALY ALERTS (Phase 14)[/]", box=box.ROUNDED, border_style="red")
+    )
+
     # Active Flow Conversations Panel
     flows_table = Table(expand=True, box=box.SIMPLE_HEAD, pad_edge=False)
     flows_table.add_column("Flow 5-Tuple", style="bold bright_white")
@@ -471,9 +556,10 @@ def main():
 
     bw_tracker = BandwidthTracker()
     flow_tracker = FlowTracker()
+    anomaly_detector = AnomalyDetector()
     latest_packet = None
 
-    with Live(create_dashboard(packets, metrics, latest_packet, bw_tracker, src_ip_stats, dst_ip_stats, port_stats, flow_tracker), refresh_per_second=4, console=console) as live:
+    with Live(create_dashboard(packets, metrics, latest_packet, bw_tracker, src_ip_stats, dst_ip_stats, port_stats, flow_tracker, anomaly_detector), refresh_per_second=4, console=console) as live:
         for line in sys.stdin:
             line = line.strip()
             if not line or not line.startswith("{"):
@@ -489,6 +575,9 @@ def main():
 
                 bw_tracker.add_packet(pkt_len)
                 flow_tracker.update(p)
+
+                rates = bw_tracker.current_rates()
+                anomaly_detector.inspect(p, rates['pps'], rates['kbs'])
 
                 src_ip = p.get("src")
                 dst_ip = p.get("dst")
@@ -518,7 +607,7 @@ def main():
                 else:
                     metrics["other"] += 1
 
-                live.update(create_dashboard(packets, metrics, latest_packet, bw_tracker, src_ip_stats, dst_ip_stats, port_stats, flow_tracker))
+                live.update(create_dashboard(packets, metrics, latest_packet, bw_tracker, src_ip_stats, dst_ip_stats, port_stats, flow_tracker, anomaly_detector))
             except json.JSONDecodeError:
                 continue
 
