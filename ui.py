@@ -251,7 +251,7 @@ def format_mini_bar(share_pct, width=10):
     empty = width - fill
     return f"[bold magenta]{'█' * fill}[/][dim]{'░' * empty}[/]"
 
-def create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats, flow_tracker):
+def create_dashboard(packets, metrics, latest_packet, bw_tracker, src_ip_stats, dst_ip_stats, port_stats, flow_tracker):
     rates = bw_tracker.current_rates()
     uptime_str = format_duration(time.time() - bw_tracker.start_time)
     resolved_count = len(dns_cache)
@@ -279,14 +279,14 @@ def create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats, flow
     header_content = Text.assemble(header_title, "\n", Text.from_markup(gauge_markup, justify="center"))
     layout["header"].update(Panel(header_content, box=box.ROUNDED, style="bright_blue"))
 
-    # --- 2. Main Split: Packet Stream (Left) & Right Side (Top Talkers + Active Flows) ---
+    # --- 2. Main Split: Packet Stream (Left) & Right Side (Stats + Flows) ---
     layout["main"].split_row(
         Layout(name="stream", ratio=7),
         Layout(name="right_side", ratio=5)
     )
 
     layout["right_side"].split(
-        Layout(name="top_talkers", ratio=1),
+        Layout(name="stats", ratio=1),
         Layout(name="flows", ratio=1)
     )
 
@@ -355,37 +355,41 @@ def create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats, flow
         Panel(stream_table, title="[bold bright_white]🌐 Live Network Packet Stream (Recent 12)[/]", box=box.ROUNDED, border_style="cyan")
     )
 
-    # Top IP Talkers & Domain Analytics Table
-    talkers_table = Table(expand=True, box=box.SIMPLE_HEAD, pad_edge=False)
-    talkers_table.add_column("Host IP / Domain", style="bold bright_white")
-    talkers_table.add_column("Volume", justify="right", style="bright_yellow")
-    talkers_table.add_column("Share", justify="center")
+    # Phase 13 - Protocol Statistics Dashboard
+    stats_table = Table(expand=True, box=box.SIMPLE_HEAD, pad_edge=False, show_header=False)
+    stats_table.add_column("Category", style="bold cyan")
+    stats_table.add_column("Value", style="bold bright_white")
+    
+    total_pkts = max(metrics["total"], 1)
+    
+    # 1. Global Stats
+    stats_table.add_row("[yellow]Packets[/]", f"{metrics['total']:,}")
+    stats_table.add_row("[yellow]Traffic[/]", f"{format_bytes(metrics['bytes'])}")
+    stats_table.add_row("[yellow]Packets/sec[/]", f"{rates['pps']:.0f}")
+    stats_table.add_row("[yellow]Bytes/sec[/]", f"{format_bytes(rates['kbs'] * 1024)}/s")
+    
+    # 2. Protocol Distribution
+    stats_table.add_row("[magenta]TCP[/]", f"{(metrics['tcp'] / total_pkts) * 100:.1f}%")
+    stats_table.add_row("[magenta]UDP[/]", f"{(metrics['udp'] / total_pkts) * 100:.1f}%")
+    stats_table.add_row("[magenta]ICMP[/]", f"{(metrics['icmp'] / total_pkts) * 100:.1f}%")
 
-    sorted_ips = sorted(ip_stats.items(), key=lambda x: x[1]["bytes"], reverse=True)[:4]
-    total_vol = max(metrics["bytes"], 1)
-
-    for ip, stat in sorted_ips:
-        share_pct = (stat["bytes"] / total_vol) * 100
-        domain_lbl = get_label(ip)
+    # 3. Top Ports
+    sorted_ports = sorted(port_stats.items(), key=lambda x: x[1], reverse=True)[:2]
+    for port, count in sorted_ports:
+        svc = COMMON_SERVICES.get(port, "CUSTOM")
+        stats_table.add_row(f"[green]Port {port} ({svc})[/]", f"{count:,} pkts")
         
-        if ip in ("8.8.8.8", "8.8.4.4", "1.1.1.1", "9.9.9.9"):
-            icon = "🌐 "
-        elif ip in ("10.0.2.15", "127.0.0.1"):
-            icon = "🏠 "
-        elif ip == "10.0.2.2":
-            icon = "⚡ "
-        else:
-            icon = "🖥️  "
+    # 4. Top Source / Dest IPs
+    sorted_src = sorted(src_ip_stats.items(), key=lambda x: x[1]["pkts"], reverse=True)[:1]
+    sorted_dst = sorted(dst_ip_stats.items(), key=lambda x: x[1]["pkts"], reverse=True)[:1]
+    
+    for ip, stat in sorted_src:
+        stats_table.add_row(f"[blue]Src: {get_short_domain(ip)}[/]", f"{stat['pkts']:,} pkts")
+    for ip, stat in sorted_dst:
+        stats_table.add_row(f"[red]Dst: {get_short_domain(ip)}[/]", f"{stat['pkts']:,} pkts")
 
-        mini_bar = format_mini_bar(share_pct, width=8)
-        talkers_table.add_row(
-            f"{icon}{domain_lbl}",
-            format_bytes(stat["bytes"]),
-            f"{mini_bar} [dim]{share_pct:4.1f}%[/]"
-        )
-
-    layout["top_talkers"].update(
-        Panel(talkers_table, title="[bold bright_white]📊 Top Talkers & Domain Share[/]", box=box.ROUNDED, border_style="magenta")
+    layout["stats"].update(
+        Panel(stats_table, title="[bold bright_white]📈 NETWORK STATISTICS[/]", box=box.ROUNDED, border_style="magenta")
     )
 
     # Active Flow Conversations Panel
@@ -461,12 +465,15 @@ def create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats, flow
 def main():
     packets = []
     metrics = {"total": 0, "tcp": 0, "udp": 0, "icmp": 0, "other": 0, "bytes": 0}
-    ip_stats = defaultdict(lambda: {"pkts": 0, "bytes": 0})
+    src_ip_stats = defaultdict(lambda: {"pkts": 0, "bytes": 0})
+    dst_ip_stats = defaultdict(lambda: {"pkts": 0, "bytes": 0})
+    port_stats = defaultdict(int)
+
     bw_tracker = BandwidthTracker()
     flow_tracker = FlowTracker()
     latest_packet = None
 
-    with Live(create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats, flow_tracker), refresh_per_second=4, console=console) as live:
+    with Live(create_dashboard(packets, metrics, latest_packet, bw_tracker, src_ip_stats, dst_ip_stats, port_stats, flow_tracker), refresh_per_second=4, console=console) as live:
         for line in sys.stdin:
             line = line.strip()
             if not line or not line.startswith("{"):
@@ -486,13 +493,20 @@ def main():
                 src_ip = p.get("src")
                 dst_ip = p.get("dst")
                 if src_ip:
-                    ip_stats[src_ip]["pkts"] += 1
-                    ip_stats[src_ip]["bytes"] += pkt_len
+                    src_ip_stats[src_ip]["pkts"] += 1
+                    src_ip_stats[src_ip]["bytes"] += pkt_len
                     resolve_ip_async(src_ip)
                 if dst_ip and dst_ip != src_ip:
-                    ip_stats[dst_ip]["pkts"] += 1
-                    ip_stats[dst_ip]["bytes"] += pkt_len
+                    dst_ip_stats[dst_ip]["pkts"] += 1
+                    dst_ip_stats[dst_ip]["bytes"] += pkt_len
                     resolve_ip_async(dst_ip)
+
+                src_port = p.get("src_port")
+                dst_port = p.get("dst_port")
+                if src_port:
+                    port_stats[src_port] += 1
+                if dst_port:
+                    port_stats[dst_port] += 1
 
                 proto = p.get("proto")
                 if proto == "TCP":
@@ -504,7 +518,7 @@ def main():
                 else:
                     metrics["other"] += 1
 
-                live.update(create_dashboard(packets, metrics, latest_packet, bw_tracker, ip_stats, flow_tracker))
+                live.update(create_dashboard(packets, metrics, latest_packet, bw_tracker, src_ip_stats, dst_ip_stats, port_stats, flow_tracker))
             except json.JSONDecodeError:
                 continue
 
