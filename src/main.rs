@@ -448,6 +448,7 @@ OUTPUT FORMAT OPTIONS:
     --json, -j               Output line-delimited JSON stream for TUI presenter
     --save, -s <FILE.pcap>   Save raw live captured packets to a PCAP file
     --flows                  Print stateful connection / flow analysis summary table on exit
+    --devices                Print discovered local network devices inventory on exit
 
 FILTERING OPTIONS:
     --filter, -f <EXPR>      Apply advanced packet filter expression:
@@ -586,6 +587,7 @@ fn main() {
     let mut filter_expr = FilterExpr::Any;
     let mut json_mode = false;
     let mut flow_mode = false;
+    let mut device_mode = false;
     let mut save_path: Option<String> = None;
     let mut read_path: Option<String> = None;
 
@@ -598,6 +600,9 @@ fn main() {
             }
             "--flows" => {
                 flow_mode = true;
+            }
+            "--devices" => {
+                device_mode = true;
             }
             "--interface" | "-i" => {
                 if i + 1 < args.len() {
@@ -619,11 +624,6 @@ fn main() {
                     eprintln!("[!] Error: Option '--save' requires a file path argument.");
                     process::exit(1);
                 }
-            }
-            let mut device_mode = false;
-
-            "--devices" => {
-                device_mode = true;
             }
             "--read" | "-r" => {
                 if i + 1 < args.len() {
@@ -833,6 +833,23 @@ fn main() {
                     let icmp_code = data[l4_start + 1];
                     l4_info = format!("Type {} ({}) Code {}", icmp_type, icmp_type_name(icmp_type), icmp_code);
                 }
+            } else if ether_type == 0x0806 && data.len() >= ip_start + 28 {
+                let oper = u16::from_be_bytes([data[ip_start + 6], data[ip_start + 7]]);
+                let sender_ip = Ipv4Addr::new(
+                    data[ip_start + 14],
+                    data[ip_start + 15],
+                    data[ip_start + 16],
+                    data[ip_start + 17],
+                );
+                let target_ip = Ipv4Addr::new(
+                    data[ip_start + 24],
+                    data[ip_start + 25],
+                    data[ip_start + 26],
+                    data[ip_start + 27],
+                );
+                src_ip_opt = Some(sender_ip);
+                dst_ip_opt = Some(target_ip);
+                l4_info = format!("ARP {}", if oper == 1 { "Request (Who has?)" } else { "Reply (Is at)" });
             }
 
             // EVALUATE ADVANCED FILTER AST
@@ -1014,6 +1031,24 @@ fn main() {
                 println!("{:<48} {:<16} {:<24} {:<10} {:<12}", flow_str, pkts_str, bytes_str, dur_str, stat.tcp_state);
             }
             println!("====================================================================================================");
+        }
+
+        if device_mode {
+            let mut unique_devices: HashMap<Ipv4Addr, String> = HashMap::new();
+            for (key, _) in &flows {
+                unique_devices.entry(key.ip_a).or_insert_with(|| "Discovered Device".to_string());
+                unique_devices.entry(key.ip_b).or_insert_with(|| "Discovered Device".to_string());
+            }
+
+            println!("\n========================================================================");
+            println!("  🖥️  PACKSNIFF LOCAL NETWORK DISCOVERY INVENTORY ({})", unique_devices.len());
+            println!("========================================================================");
+            println!("{:<20} {:<24} {:<24}", "IP ADDRESS", "DESCRIPTION / HOST", "STATUS");
+            println!("------------------------------------------------------------------------");
+            for (ip, desc) in &unique_devices {
+                println!("{:<20} {:<24} {:<24}", ip, desc, "ACTIVE");
+            }
+            println!("========================================================================");
         }
     }
 }

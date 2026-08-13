@@ -27,6 +27,7 @@ show_help() {
     echo "OPTIONS:"
     echo "  --ui                   Launch live Python Rich TUI telemetry dashboard"
     echo "  --flows                Display stateful connection flow analysis summary"
+    echo "  --devices              Display local network devices inventory on exit"
     echo "  --read, -r <FILE.pcap> Replay saved PCAP capture file offline"
     echo "  --save, -s <FILE.pcap> Save live captured traffic to PCAP file"
     echo "  --filter, -f <EXPR>    Advanced filter (e.g. \"tcp and port 443\", \"src 10.0.2.15\")"

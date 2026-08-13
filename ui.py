@@ -396,7 +396,7 @@ def format_mini_bar(share_pct, width=10):
     empty = width - fill
     return f"[bold magenta]{'█' * fill}[/][dim]{'░' * empty}[/]"
 
-def create_dashboard(packets, metrics, latest_packet, bw_tracker, src_ip_stats, dst_ip_stats, port_stats, flow_tracker, anomaly_detector):
+def create_dashboard(packets, metrics, latest_packet, bw_tracker, src_ip_stats, dst_ip_stats, port_stats, flow_tracker, anomaly_detector, device_tracker):
     rates = bw_tracker.current_rates()
     uptime_str = format_duration(time.time() - bw_tracker.start_time)
     resolved_count = len(dns_cache)
@@ -432,6 +432,7 @@ def create_dashboard(packets, metrics, latest_packet, bw_tracker, src_ip_stats, 
 
     layout["right_side"].split(
         Layout(name="stats", ratio=2),
+        Layout(name="devices", ratio=2),
         Layout(name="alerts", ratio=2),
         Layout(name="flows", ratio=2)
     )
@@ -538,6 +539,24 @@ def create_dashboard(packets, metrics, latest_packet, bw_tracker, src_ip_stats, 
         Panel(stats_table, title="[bold bright_white]📈 NETWORK STATISTICS[/]", box=box.ROUNDED, border_style="magenta")
     )
 
+    # Phase 15 - Local Network Devices Panel
+    devices_table = Table(expand=True, box=box.SIMPLE_HEAD, pad_edge=False)
+    devices_table.add_column("IP Address", style="bold bright_cyan", width=15)
+    devices_table.add_column("MAC Address", style="bold yellow", width=18)
+    devices_table.add_column("Host / Description", style="bold bright_white", width=22)
+    devices_table.add_column("MAC Vendor", style="magenta", width=18)
+
+    for dev in device_tracker.get_discovered_devices()[:3]:
+        ip = dev["ip"]
+        mac = dev["mac"]
+        host = get_short_domain(ip)
+        vendor = dev["vendor"]
+        devices_table.add_row(ip, mac, host, vendor)
+
+    layout["devices"].update(
+        Panel(devices_table, title="[bold bright_white]🖥️  LOCAL NETWORK DEVICES (Phase 15)[/]", box=box.ROUNDED, border_style="cyan")
+    )
+
     # Phase 14 - Security & Anomaly Alerts Panel
     alerts_table = Table(expand=True, box=box.SIMPLE_HEAD, pad_edge=False, show_header=False)
     alerts_table.add_column("Level", width=12, justify="center")
@@ -638,9 +657,10 @@ def main():
     bw_tracker = BandwidthTracker()
     flow_tracker = FlowTracker()
     anomaly_detector = AnomalyDetector()
+    device_tracker = DeviceTracker()
     latest_packet = None
 
-    with Live(create_dashboard(packets, metrics, latest_packet, bw_tracker, src_ip_stats, dst_ip_stats, port_stats, flow_tracker, anomaly_detector), refresh_per_second=4, console=console) as live:
+    with Live(create_dashboard(packets, metrics, latest_packet, bw_tracker, src_ip_stats, dst_ip_stats, port_stats, flow_tracker, anomaly_detector, device_tracker), refresh_per_second=4, console=console) as live:
         for line in sys.stdin:
             line = line.strip()
             if not line or not line.startswith("{"):
@@ -656,6 +676,7 @@ def main():
 
                 bw_tracker.add_packet(pkt_len)
                 flow_tracker.update(p)
+                device_tracker.update(p)
 
                 rates = bw_tracker.current_rates()
                 anomaly_detector.inspect(p, rates['pps'], rates['kbs'])
@@ -688,7 +709,7 @@ def main():
                 else:
                     metrics["other"] += 1
 
-                live.update(create_dashboard(packets, metrics, latest_packet, bw_tracker, src_ip_stats, dst_ip_stats, port_stats, flow_tracker, anomaly_detector))
+                live.update(create_dashboard(packets, metrics, latest_packet, bw_tracker, src_ip_stats, dst_ip_stats, port_stats, flow_tracker, anomaly_detector, device_tracker))
             except json.JSONDecodeError:
                 continue
 
