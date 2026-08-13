@@ -50,6 +50,34 @@ COMMON_SERVICES = {
     3306: "MySQL", 5432: "PostgreSQL", 8080: "HTTP-ALT", 8443: "HTTPS-ALT"
 }
 
+MAC_VENDORS = {
+    "08:00:27": "Oracle VirtualBox",
+    "00:05:69": "VMware",
+    "00:0C:29": "VMware",
+    "00:50:56": "VMware",
+    "52:54:00": "QEMU/KVM",
+    "B8:27:EB": "Raspberry Pi",
+    "DC:A6:32": "Raspberry Pi",
+    "E4:5F:01": "Raspberry Pi",
+    "00:1A:11": "Google",
+    "F4:F5:DB": "Google",
+    "00:03:93": "Apple",
+    "AC:BC:32": "Apple",
+    "00:15:5D": "Microsoft Hyper-V",
+    "00:1B:21": "Intel",
+    "00:1E:67": "Intel",
+    "3C:D9:2B": "HP",
+    "70:85:C2": "Asus",
+    "E0:D5:5E": "Cisco",
+}
+
+def get_mac_vendor(mac_str):
+    if not mac_str or mac_str == "00:00:00:00:00:00" or mac_str == "FF:FF:FF:FF:FF:FF":
+        return "Broadcast/Unknown"
+    prefix = mac_str.upper()[:8]
+    return MAC_VENDORS.get(prefix, "Generic Vendor")
+
+
 # Thread-safe Reverse DNS Cache
 dns_cache = dict(KNOWN_DOMAINS)
 cache_lock = threading.Lock()
@@ -250,6 +278,59 @@ class AnomalyDetector:
     def get_recent_alerts(self, limit=4):
         return self.alerts[-limit:]
 
+class DeviceTracker:
+    def __init__(self):
+        # ip -> {mac, hostname, vendor, pkts, bytes, first_seen, last_seen, is_arp}
+        self.devices = {}
+
+    def update(self, p):
+        src_ip = p.get("src")
+        src_mac = p.get("src_mac")
+        dst_ip = p.get("dst")
+        dst_mac = p.get("dst_mac")
+        pkt_len = p.get("len", 0)
+        proto = p.get("proto")
+        now = time.time()
+
+        # Handle Source Device
+        if src_ip and src_mac and not src_ip.startswith("00:"):
+            if src_ip not in self.devices:
+                self.devices[src_ip] = {
+                    "ip": src_ip,
+                    "mac": src_mac,
+                    "vendor": get_mac_vendor(src_mac),
+                    "pkts": 0,
+                    "bytes": 0,
+                    "first_seen": now,
+                    "last_seen": now,
+                    "proto_last": proto
+                }
+            d = self.devices[src_ip]
+            d["mac"] = src_mac
+            d["vendor"] = get_mac_vendor(src_mac)
+            d["pkts"] += 1
+            d["bytes"] += pkt_len
+            d["last_seen"] = now
+            d["proto_last"] = proto
+
+        # Handle Destination Device (for Local IPs)
+        if dst_ip and dst_mac and not dst_ip.startswith("00:") and dst_mac != "FF:FF:FF:FF:FF:FF":
+            if dst_ip not in self.devices:
+                self.devices[dst_ip] = {
+                    "ip": dst_ip,
+                    "mac": dst_mac,
+                    "vendor": get_mac_vendor(dst_mac),
+                    "pkts": 0,
+                    "bytes": 0,
+                    "first_seen": now,
+                    "last_seen": now,
+                    "proto_last": proto
+                }
+            d = self.devices[dst_ip]
+            d["last_seen"] = now
+
+    def get_discovered_devices(self):
+        return sorted(self.devices.values(), key=lambda x: x["last_seen"], reverse=True)
 
 
 class FlowTracker:

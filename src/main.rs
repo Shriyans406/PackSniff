@@ -620,6 +620,11 @@ fn main() {
                     process::exit(1);
                 }
             }
+            let mut device_mode = false;
+
+            "--devices" => {
+                device_mode = true;
+            }
             "--read" | "-r" => {
                 if i + 1 < args.len() {
                     read_path = Some(args[i + 1].clone());
