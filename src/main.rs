@@ -1,6 +1,7 @@
 use pcap::Capture;
 use std::env;
-use std::io::{self, Write};
+use std::fs::File;
+use std::io::{self, BufWriter, Write};
 use std::net::Ipv4Addr;
 use std::process;
 use std::str::FromStr;
@@ -447,6 +448,7 @@ CAPTURE SOURCE OPTIONS (Required):
 OUTPUT FORMAT OPTIONS:
     --json, -j               Output line-delimited JSON stream for TUI presenter
     --save, -s <FILE.pcap>   Save raw live captured packets to a PCAP file
+    --output, -o <FILE>      Export packets to file by extension: .pcap / .json / .csv
     --flows                  Print stateful connection / flow analysis summary table on exit
     --devices                Print discovered local network devices inventory on exit
 
@@ -590,6 +592,7 @@ fn main() {
     let mut device_mode = false;
     let mut save_path: Option<String> = None;
     let mut read_path: Option<String> = None;
+    let mut output_path: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -603,6 +606,15 @@ fn main() {
             }
             "--devices" => {
                 device_mode = true;
+            }
+            "--output" | "-o" => {
+                if i + 1 < args.len() {
+                    output_path = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    eprintln!("[!] Error: Option '--output' requires a file path argument.");
+                    process::exit(1);
+                }
             }
             "--interface" | "-i" => {
                 if i + 1 < args.len() {
@@ -734,6 +746,56 @@ fn main() {
         }
     } else {
         None
+    };
+
+    // --- Output file writer setup (JSON / CSV export) ---
+    enum OutputMode {
+        None,
+        Json(BufWriter<File>),
+        Csv(BufWriter<File>),
+    }
+
+    // If --output *.pcap is given, treat it as --save alias
+    if let Some(ref o_path) = output_path {
+        let ext = o_path.rsplit('.').next().unwrap_or("").to_lowercase();
+        if ext == "pcap" && save_path.is_none() {
+            save_path = Some(o_path.clone());
+        }
+    }
+
+    let mut output_writer: OutputMode = if let Some(ref o_path) = output_path {
+        let ext = o_path.rsplit('.').next().unwrap_or("").to_lowercase();
+        match ext.as_str() {
+            "json" => match File::create(o_path) {
+                Ok(f) => {
+                    if !json_mode {
+                        println!("[+] Exporting packets to JSON file: {}...", o_path);
+                    }
+                    OutputMode::Json(BufWriter::new(f))
+                }
+                Err(e) => {
+                    eprintln!("[!] Failed to create JSON output file '{}': {}", o_path, e);
+                    process::exit(1);
+                }
+            },
+            "csv" => match File::create(o_path) {
+                Ok(f) => {
+                    if !json_mode {
+                        println!("[+] Exporting packets to CSV file: {}...", o_path);
+                    }
+                    let mut writer = BufWriter::new(f);
+                    writeln!(writer, "id,proto,src,src_port,dst,dst_port,len,ttl,l4_info,src_mac,dst_mac").ok();
+                    OutputMode::Csv(writer)
+                }
+                Err(e) => {
+                    eprintln!("[!] Failed to create CSV output file '{}': {}", o_path, e);
+                    process::exit(1);
+                }
+            },
+            _ => OutputMode::None,
+        }
+    } else {
+        OutputMode::None
     };
 
     let mut packet_count: u64 = 0;
@@ -904,37 +966,61 @@ fn main() {
                 }
             }
 
+            // Build decoded string fields for both stdout and file export
+            let proto_str = match protocol_opt {
+                Some(p) => protocol_name(p),
+                None => match ether_type {
+                    0x0806 => "ARP",
+                    0x86DD => "IPv6",
+                    _ => "ETH",
+                },
+            };
+            let src_ip_str = src_ip_opt.map(|ip| ip.to_string()).unwrap_or_else(|| format_mac(src_mac));
+            let dst_ip_str = dst_ip_opt.map(|ip| ip.to_string()).unwrap_or_else(|| format_mac(dst_mac));
+            let hex_str = hex_encode(data, 32);
+            let json_line = format!(
+                "{{\"id\":{},\"captured\":{},\"len\":{},\"proto\":\"{}\",\"src\":\"{}\",\"dst\":\"{}\",\"src_port\":{},\"dst_port\":{},\"ttl\":{},\"l4_info\":\"{}\",\"src_mac\":\"{}\",\"dst_mac\":\"{}\",\"hex\":\"{}\"}}",
+                matched_count,
+                packet_count,
+                data.len(),
+                proto_str,
+                src_ip_str,
+                dst_ip_str,
+                src_port_opt.map(|p| p.to_string()).unwrap_or_else(|| "null".to_string()),
+                dst_port_opt.map(|p| p.to_string()).unwrap_or_else(|| "null".to_string()),
+                ttl_opt.map(|t| t.to_string()).unwrap_or_else(|| "null".to_string()),
+                l4_info.replace('"', "\\\""),
+                format_mac(src_mac),
+                format_mac(dst_mac),
+                hex_str
+            );
+
+            // Write to --output file if specified
+            match &mut output_writer {
+                OutputMode::Json(ref mut writer) => {
+                    writeln!(writer, "{}", json_line).ok();
+                }
+                OutputMode::Csv(ref mut writer) => {
+                    writeln!(
+                        writer,
+                        "{},{},{},{},{},{},{},{},{},{},{}",
+                        matched_count,
+                        proto_str,
+                        src_ip_str,
+                        src_port_opt.map(|p| p.to_string()).unwrap_or_default(),
+                        dst_ip_str,
+                        dst_port_opt.map(|p| p.to_string()).unwrap_or_default(),
+                        data.len(),
+                        ttl_opt.map(|t| t.to_string()).unwrap_or_default(),
+                        l4_info.replace(',', ";"),
+                        format_mac(src_mac),
+                        format_mac(dst_mac)
+                    ).ok();
+                }
+                OutputMode::None => {}
+            }
+
             if json_mode {
-                let proto_str = match protocol_opt {
-                    Some(p) => protocol_name(p),
-                    None => match ether_type {
-                        0x0806 => "ARP",
-                        0x86DD => "IPv6",
-                        _ => "ETH",
-                    },
-                };
-
-                let src_ip_str = src_ip_opt.map(|ip| ip.to_string()).unwrap_or_else(|| format_mac(src_mac));
-                let dst_ip_str = dst_ip_opt.map(|ip| ip.to_string()).unwrap_or_else(|| format_mac(dst_mac));
-                let hex_str = hex_encode(data, 32);
-
-                let json_line = format!(
-                    "{{\"id\":{},\"captured\":{},\"len\":{},\"proto\":\"{}\",\"src\":\"{}\",\"dst\":\"{}\",\"src_port\":{},\"dst_port\":{},\"ttl\":{},\"l4_info\":\"{}\",\"src_mac\":\"{}\",\"dst_mac\":\"{}\",\"hex\":\"{}\"}}",
-                    matched_count,
-                    packet_count,
-                    data.len(),
-                    proto_str,
-                    src_ip_str,
-                    dst_ip_str,
-                    src_port_opt.map(|p| p.to_string()).unwrap_or_else(|| "null".to_string()),
-                    dst_port_opt.map(|p| p.to_string()).unwrap_or_else(|| "null".to_string()),
-                    ttl_opt.map(|t| t.to_string()).unwrap_or_else(|| "null".to_string()),
-                    l4_info.replace('"', "\\\""),
-                    format_mac(src_mac),
-                    format_mac(dst_mac),
-                    hex_str
-                );
-
                 safe_println(&json_line);
             } else {
                 let eth_desc = match ether_type {
